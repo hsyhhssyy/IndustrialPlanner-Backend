@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: industrial-planner-backend
+data:
+  HTTP_BIND_ADDR: "0.0.0.0:8080"
+  RUST_LOG: "industrial_planner_backend=info,tower_http=info"
+  TELEMETRY_MAX_BODY_BYTES: "65536"
+  TELEMETRY_RATE_WINDOW_SECONDS: "60"
+  TELEMETRY_GLOBAL_RATE_LIMIT: "600"
+  TELEMETRY_IDENTITY_RATE_LIMIT: "30"
+  TELEMETRY_IP_RATE_LIMIT: "60"
+  DATABASE_MAX_CONNECTIONS: "10"
+
+  # 首次部署保持空值。确认 Ingress 到 Pod 的真实来源网段后，再填写逗号分隔 CIDR。
+  # 示例（仅示意，不可直接照抄）："10.42.0.0/16,10.43.0.0/16"
+  TRUSTED_PROXY_CIDRS: ""

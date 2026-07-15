@@ -1,0 +1,9 @@
+.git
+.docs
+.temp
+target
+.env
+.env.*
+!/.env.example
+deploy
+README.md
