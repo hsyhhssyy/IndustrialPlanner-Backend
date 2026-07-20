@@ -11,5 +11,5 @@ FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=builder /app/target/release/industrial-planner-backend /usr/local/bin/industrial-planner-backend
 ENV HTTP_BIND_ADDR=0.0.0.0:8080
 EXPOSE 8080
-USER nonroot:nonroot
+USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/industrial-planner-backend"]
