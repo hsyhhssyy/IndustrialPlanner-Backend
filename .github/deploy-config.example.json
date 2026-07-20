@@ -1,0 +1,16 @@
+{
+  "registry": "docker.hsyhhssyy.net",
+  "username": "your-username",
+  "password": "your-password",
+  "image_name": "industrial-planner-backend",
+  "namespace": "amiyabot",
+  "domain": "endfield-api.amiyabot.com",
+  "stable": {
+    "database_url": "mysql://user:password@mysql-01-clusterip.database.svc.cluster.local:3306/industrial_planner",
+    "redis_url": "redis://user:password@host:6379"
+  },
+  "beta": {
+    "database_url": "mysql://user:password@mysql-01-clusterip.database.svc.cluster.local:3306/industrial_planner_beta",
+    "redis_url": "redis://user:password@host:6379"
+  }
+}
