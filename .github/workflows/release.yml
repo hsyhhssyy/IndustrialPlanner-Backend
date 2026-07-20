@@ -215,10 +215,10 @@ jobs:
           config_file="$RUNNER_TEMP/deploy-config.json"
           printf '%s' "$DEPLOY_CONFIG" > "$config_file"
 
-          domain="$(jq -r '.domain' "$config_file")"
-          namespace="$(jq -r '.namespace' "$config_file")"
+          namespace="$(jq -r ".${RELEASE_CHANNEL}.namespace" "$config_file")"
           database_url="$(jq -r ".${RELEASE_CHANNEL}.database_url" "$config_file")"
           redis_url="$(jq -r ".${RELEASE_CHANNEL}.redis_url" "$config_file")"
+          domain="$(jq -r ".${RELEASE_CHANNEL}.domain" "$config_file")"
 
           # 验证所有必需字段非空
           for var in domain namespace database_url redis_url; do
