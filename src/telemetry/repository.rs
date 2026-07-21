@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::database::DatabasePool;
 
-use super::TelemetryPayload;
+use super::{DeviceType, TelemetryPayload};
 
 #[derive(Clone)]
 pub(crate) struct TelemetryRepository {
@@ -32,10 +32,12 @@ impl TelemetryRepository {
                     INSERT INTO sync_shadow_telemetry (
                         created_at, schema_version, source, trigger, app_version, user_agent_hash,
                         install_id_hash, device_id_hash, owner_kind, owner_scope_hash, diagnostics,
-                        compact_summaries, remote_ip, request_id
+                        compact_summaries, remote_ip, request_id,
+                        device_type, screen_width, screen_height, device_pixel_ratio
                     )
                     VALUES (
-                        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::inet, $14
+                        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::inet, $14,
+                        $15, $16, $17, $18
                     )
                     ON CONFLICT (install_id_hash, created_at, trigger) DO NOTHING
                     "#,
@@ -54,6 +56,10 @@ impl TelemetryRepository {
                 .bind(SqlJson(&payload.compact_summaries))
                 .bind(&remote_ip)
                 .bind(request_id)
+                .bind(payload.device_type.as_ref().map(DeviceType::as_str))
+                .bind(payload.screen_width.map(i64::from))
+                .bind(payload.screen_height.map(i64::from))
+                .bind(payload.device_pixel_ratio)
                 .execute(pool)
                 .await?;
             }
@@ -63,9 +69,10 @@ impl TelemetryRepository {
                     INSERT INTO sync_shadow_telemetry (
                         created_at, schema_version, source, `trigger`, app_version, user_agent_hash,
                         install_id_hash, device_id_hash, owner_kind, owner_scope_hash, diagnostics,
-                        compact_summaries, remote_ip, request_id
+                        compact_summaries, remote_ip, request_id,
+                        device_type, screen_width, screen_height, device_pixel_ratio
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON DUPLICATE KEY UPDATE id = id
                     "#,
                 )
@@ -83,6 +90,10 @@ impl TelemetryRepository {
                 .bind(SqlJson(&payload.compact_summaries))
                 .bind(&remote_ip)
                 .bind(request_id)
+                .bind(payload.device_type.as_ref().map(DeviceType::as_str))
+                .bind(payload.screen_width)
+                .bind(payload.screen_height)
+                .bind(payload.device_pixel_ratio)
                 .execute(pool)
                 .await?;
             }

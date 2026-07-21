@@ -11,7 +11,7 @@ mod rate_limit;
 #[path = "telemetry/repository.rs"]
 mod repository;
 
-pub(crate) use contract::TelemetryPayload;
+pub(crate) use contract::{DeviceType, TelemetryPayload};
 pub(crate) use http::{TelemetryHttpState, router};
 pub(crate) use rate_limit::{Admission, RateLimitConfig, RateLimiter};
 pub(crate) use repository::TelemetryRepository;

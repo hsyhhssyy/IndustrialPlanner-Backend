@@ -13,6 +13,9 @@ const MAX_DIAGNOSTIC_STRING_LENGTH: usize = 128;
 const MAX_DETAIL_FIELDS: usize = 32;
 const MAX_DETAIL_KEY_LENGTH: usize = 64;
 const MAX_DETAIL_STRING_LENGTH: usize = 200;
+const MAX_SCREEN_DIMENSION: u32 = 16384;
+const MIN_DEVICE_PIXEL_RATIO: f64 = 0.1;
+const MAX_DEVICE_PIXEL_RATIO: f64 = 10.0;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -27,6 +30,10 @@ pub(crate) struct TelemetryPayload {
     pub(crate) device_id_hash: String,
     pub(crate) owner_kind: OwnerKind,
     pub(crate) owner_scope_hash: String,
+    pub(crate) device_type: Option<DeviceType>,
+    pub(crate) screen_width: Option<u32>,
+    pub(crate) screen_height: Option<u32>,
+    pub(crate) device_pixel_ratio: Option<f64>,
     pub(crate) diagnostics: Vec<DiagnosticEvent>,
     pub(crate) compact_summaries: Vec<CompactSummary>,
 }
@@ -51,6 +58,24 @@ impl TelemetryPayload {
         {
             return Err(ValidationError::TooManyItems);
         }
+        if let Some(w) = self.screen_width {
+            if w == 0 || w > MAX_SCREEN_DIMENSION {
+                return Err(ValidationError::InvalidDeviceInfo);
+            }
+        }
+        if let Some(h) = self.screen_height {
+            if h == 0 || h > MAX_SCREEN_DIMENSION {
+                return Err(ValidationError::InvalidDeviceInfo);
+            }
+        }
+        if let Some(dpr) = self.device_pixel_ratio {
+            if !(MIN_DEVICE_PIXEL_RATIO..=MAX_DEVICE_PIXEL_RATIO).contains(&dpr)
+                || dpr.is_nan()
+                || dpr.is_infinite()
+            {
+                return Err(ValidationError::InvalidDeviceInfo);
+            }
+        }
         for diagnostic in &self.diagnostics {
             diagnostic.validate()?;
         }
@@ -73,6 +98,24 @@ impl OwnerKind {
         match self {
             Self::Anonymous => "anonymous",
             Self::Account => "account",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum DeviceType {
+    Tablet,
+    Mobile,
+    Pc,
+}
+
+impl DeviceType {
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::Tablet => "tablet",
+            Self::Mobile => "mobile",
+            Self::Pc => "pc",
         }
     }
 }
@@ -203,6 +246,8 @@ pub(crate) enum ValidationError {
     InvalidHash,
     #[error("telemetry compact summary is invalid")]
     InvalidSummary,
+    #[error("telemetry device info is invalid")]
+    InvalidDeviceInfo,
 }
 
 impl ValidationError {
@@ -214,6 +259,7 @@ impl ValidationError {
             Self::InvalidField => "invalid_field",
             Self::InvalidHash => "invalid_hash",
             Self::InvalidSummary => "invalid_summary",
+            Self::InvalidDeviceInfo => "invalid_device_info",
         }
     }
 }
