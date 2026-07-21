@@ -234,12 +234,19 @@ jobs:
           echo "DATABASE_URL=$database_url" >> "$GITHUB_ENV"
           echo "REDIS_URL=$redis_url" >> "$GITHUB_ENV"
 
+          if [ "$RELEASE_CHANNEL" = 'beta' ]; then
+            echo "ENVIRONMENT=beta" >> "$GITHUB_ENV"
+          else
+            echo "ENVIRONMENT=production" >> "$GITHUB_ENV"
+          fi
+
       - name: Render and apply K8s manifests
         env:
           DOMAIN: ${{ env.domain }}
           NAMESPACE: ${{ env.namespace }}
           DATABASE_URL: ${{ env.DATABASE_URL }}
           REDIS_URL: ${{ env.REDIS_URL }}
+          ENVIRONMENT: ${{ env.ENVIRONMENT }}
           KUBECONFIG_DATA: ${{ secrets.KUBE_CONFIG }}
         shell: bash
         run: |

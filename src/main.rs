@@ -3,6 +3,7 @@ mod assets;
 mod config;
 mod database;
 mod identity;
+mod logs;
 mod oauth;
 mod sync;
 mod telemetry;
@@ -16,6 +17,7 @@ use axum::{
 };
 use config::Config;
 use database::DatabasePool;
+use logs::LogBuffer;
 use telemetry::{RateLimitConfig, RateLimiter, TelemetryHttpState, TelemetryRepository};
 use tokio::net::TcpListener;
 use tower_http::{
@@ -27,7 +29,8 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    init_tracing();
+    let log_buffer = Arc::new(LogBuffer::new(10_000));
+    init_tracing(logs::LogCapture::new(log_buffer.clone()));
 
     let config = Config::from_env()?;
     let database =
@@ -53,10 +56,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(rate_limiter),
         Arc::new(config.trusted_proxy_cidrs),
     );
-    let app = build_app(database, telemetry, config.telemetry_max_body_bytes);
+    let app = build_app(
+        database,
+        telemetry,
+        config.telemetry_max_body_bytes,
+        config.environment.clone(),
+        log_buffer,
+    );
 
     let listener = TcpListener::bind(config.http_bind_addr).await?;
-    info!(address = %config.http_bind_addr, "HTTP server is listening");
+    info!(
+        address = %config.http_bind_addr,
+        environment = %config.environment,
+        "HTTP server is listening"
+    );
 
     axum::serve(
         listener,
@@ -72,6 +85,8 @@ fn build_app(
     database: DatabasePool,
     telemetry: TelemetryHttpState,
     telemetry_max_body_bytes: usize,
+    environment: String,
+    log_buffer: Arc<LogBuffer>,
 ) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -83,19 +98,20 @@ fn build_app(
         .max_age(std::time::Duration::from_secs(86_400));
 
     Router::new()
-        .merge(api::router(database, telemetry))
+        .merge(api::router(database, telemetry, environment, log_buffer))
         .layer(DefaultBodyLimit::max(telemetry_max_body_bytes))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
 }
 
-fn init_tracing() {
+fn init_tracing(writer: logs::LogCapture) {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("industrial_planner_backend=info,tower_http=info"));
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .json()
+        .with_writer(writer)
         .init();
 }
 

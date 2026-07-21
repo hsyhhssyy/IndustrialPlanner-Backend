@@ -40,6 +40,8 @@ spec:
               value: "0.0.0.0:8080"
             - name: RUST_LOG
               value: "industrial_planner_backend=info,tower_http=info"
+            - name: ENVIRONMENT
+              value: "${ENVIRONMENT}"
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:

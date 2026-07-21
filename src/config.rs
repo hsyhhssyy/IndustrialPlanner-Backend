@@ -14,6 +14,7 @@ pub(crate) struct Config {
     pub(crate) telemetry_identity_rate_limit: NonZeroU32,
     pub(crate) telemetry_ip_rate_limit: NonZeroU32,
     pub(crate) database_max_connections: u32,
+    pub(crate) environment: String,
 }
 
 #[derive(Debug, Error)]
@@ -54,6 +55,7 @@ impl Config {
             telemetry_identity_rate_limit: parse_nonzero("TELEMETRY_IDENTITY_RATE_LIMIT", "30")?,
             telemetry_ip_rate_limit: parse_nonzero("TELEMETRY_IP_RATE_LIMIT", "60")?,
             database_max_connections: parse("DATABASE_MAX_CONNECTIONS", "10")?,
+            environment: env::var("ENVIRONMENT").unwrap_or_else(|_| "unknown".to_owned()),
         })
     }
 }
