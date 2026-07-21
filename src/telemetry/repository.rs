@@ -61,7 +61,7 @@ impl TelemetryRepository {
                 sqlx::query(
                     r#"
                     INSERT INTO sync_shadow_telemetry (
-                        created_at, schema_version, source, trigger, app_version, user_agent_hash,
+                        created_at, schema_version, source, `trigger`, app_version, user_agent_hash,
                         install_id_hash, device_id_hash, owner_kind, owner_scope_hash, diagnostics,
                         compact_summaries, remote_ip, request_id
                     )
