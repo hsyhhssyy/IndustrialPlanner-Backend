@@ -209,3 +209,11 @@ AI 在分析代码时必须区分：
 .temp/.trash 才是真正的临时目录
 当你想要生成一次性脚本，在磁盘上放置一次性临时文件时，请放置到 .temp/.trash 下的某个位置
 未经用户明确允许，不可以在.temp下其他位置写入文件。
+
+## Beta 环境数据库与 Redis
+
+`.temp/deploy-config.json` 的 `beta` 字段包含可访问的 Beta 环境数据库和 Redis 连接信息：
+- `beta.database_url` — MySQL 连接字符串
+- `beta.redis_url` — Redis 连接字符串
+
+需要连接 Beta 环境进行调试或集成测试时，从此文件读取。
