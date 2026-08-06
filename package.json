@@ -1,0 +1,16 @@
+{
+  "name": "industrial-planner-backend",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "lint": "pnpm --recursive lint",
+    "test": "pnpm --recursive test",
+    "typecheck": "pnpm --recursive typecheck"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.0"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}

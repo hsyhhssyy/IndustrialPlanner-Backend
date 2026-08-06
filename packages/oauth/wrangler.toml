@@ -1,0 +1,7 @@
+# OAuth Worker — 第三方登录与授权（空壳）
+name = "industrial-oauth"
+main = "src/index.ts"
+compatibility_date = "2025-08-06"
+
+[dev]
+port = 8790

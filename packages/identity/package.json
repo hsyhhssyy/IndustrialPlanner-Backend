@@ -1,0 +1,19 @@
+{
+  "name": "@industrial/identity",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "scripts": {
+    "lint": "echo ok",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@industrial/shared": "workspace:*",
+    "hono": "^4.8.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250801.0",
+    "wrangler": "^4.20.0"
+  }
+}

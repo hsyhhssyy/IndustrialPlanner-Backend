@@ -1,0 +1,16 @@
+# Assets Worker — 资产目录与配额（空壳）
+name = "industrial-assets"
+main = "src/index.ts"
+compatibility_date = "2025-08-06"
+
+# [[d1_databases]]
+# binding = "DB"
+# database_name = "assets-db"
+# database_id = ""
+#
+# [[r2_buckets]]
+# binding = "ASSETS"
+# bucket_name = "industrial-assets"
+
+[dev]
+port = 8791

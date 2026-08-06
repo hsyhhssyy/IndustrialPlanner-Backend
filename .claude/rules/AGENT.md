@@ -120,7 +120,7 @@ AI 不得静默删除任何代码或注释。
 
 3. 删除记录格式：
 
-```rust
+```typescript
 // AI-REMOVED 2026-05-09:
 // Reason: <为什么删除>
 // Trigger: <什么 bug / 需求 / 冲突 / 编译错误导致>
@@ -151,15 +151,15 @@ AI 在分析代码时必须区分：
 该文件规定了项目引入模块的不可违背的原则。
 修复Bug时只要你改动代码符合上述需求，也需要阅读这个文件。
 
-## 自动化测试（Rust 后端）
+## 自动化测试（TypeScript / Cloudflare Workers 后端）
 
-本项目是 Rust HTTP 后端，不使用浏览器、Playwright 或前端视觉测试。测试必须验证真实的协议、持久化和并发语义，而不是为测试构造与生产路径不同的替身。
+本项目是 TypeScript Cloudflare Workers 后端，不使用浏览器、Playwright 或前端视觉测试。测试必须验证真实的协议、持久化和并发语义，而不是为测试构造与生产路径不同的替身。
 
 1. 改动 HTTP 接口时，必须覆盖路由、状态码、CORS、请求体边界和前端当前实际发送的 JSON 合约。
-2. 改动 PostgreSQL/MySQL migration、Redis 限流/去重、并发或事务语义时，必须补充针对隔离 PostgreSQL、MySQL、Redis 实例的集成测试；不得连接开发者、共享或生产数据库。
-3. 纯解析、校验、配置和无外部状态的逻辑使用单元测试；不得为了隔离测试而 mock 掉被测的业务语义。
-4. 测试临时数据、日志和一次性 compose 文件只能置于 `.temp/.trash/` 下，并在结束后清理。
-5. 若当前环境不具备安全的集成测试依赖，应明确报告未验证的边界和所需环境；不得静默跳过或伪造通过结果。
+2. 改动 D1 migration、KV 限流/会话、R2 存储或事务语义时，必须使用 Miniflare 本地模拟环境进行集成测试；不得连接 Cloudflare 生产环境的真实 D1/KV/R2 实例。
+3. 纯解析、校验、配置和无外部状态的逻辑使用 Vitest 单元测试；不得为了隔离测试而 mock 掉被测的业务语义。
+4. 测试临时数据、日志和一次性文件只能置于 `.temp/.trash/` 下，并在结束后清理。
+5. 若当前环境不具备 Miniflare 依赖（如 better-sqlite3 原生模块），应明确报告未验证的边界和所需环境；不得静默跳过或伪造通过结果。
 
 ## 不要在工作区引入无关文件
 
@@ -170,7 +170,7 @@ AI 在分析代码时必须区分：
 
 如果用户在指令中使用中文提及任何 API、领域对象、数据库实体、基础设施组件或业务概念，你在查询文档和搜索时，必须使用用户原始的中文词汇进行搜索。
 
-对于需要映射到代码标识符或外部协议的概念，先在仓库的文档、公开 API 合约、数据库 migration 和 Rust 类型中查找对应名称；找到后再同时使用用户原始中文词汇和既有标识符搜索。
+对于需要映射到代码标识符或外部协议的概念，先在仓库的文档、公开 API 合约、数据库 migration 和 TypeScript 类型中查找对应名称；找到后再同时使用用户原始中文词汇和既有标识符搜索。
 
 严禁自行翻译用户提出的概念后直接作为实现名称、查询关键词或对外 API 名称。
 
@@ -194,15 +194,18 @@ AI 在分析代码时必须区分：
 - `git log`
 - `git show`
 
-## Rust 测试执行方式
+## TypeScript 测试执行方式
 
-本项目的可重复验证命令以 `Cargo.toml` 和 `.github/workflows/ci.yml` 为准。除非用户限定验证范围，完成 Rust 代码改动后依次执行：
+本项目的可重复验证命令以 `package.json` 为准。除非用户限定验证范围，完成 TypeScript 代码改动后依次执行：
 
-    cargo fmt --check
-    cargo clippy --all-targets -- -D warnings
-    cargo test --locked
+    pnpm lint
+    pnpm test
 
-需要 PostgreSQL、MySQL、Redis、Ingress 或 Kubernetes 的集成验证时，先阅读对应部署文档和测试说明；不得将本地或生产服务当作测试靶场。
+需要 D1、KV、R2 或 Service Binding 的集成验证时，使用 Miniflare 本地模拟环境；不得将 Cloudflare 生产服务当作测试靶场。
+
+单个 Worker 的测试：
+
+    pnpm --filter <worker> test
 
 ## 临时目录的使用
 
@@ -210,10 +213,8 @@ AI 在分析代码时必须区分：
 当你想要生成一次性脚本，在磁盘上放置一次性临时文件时，请放置到 .temp/.trash 下的某个位置
 未经用户明确允许，不可以在.temp下其他位置写入文件。
 
-## Beta 环境数据库与 Redis
+## Beta 环境
 
-`.temp/deploy-config.json` 的 `beta` 字段包含可访问的 Beta 环境数据库和 Redis 连接信息：
-- `beta.database_url` — MySQL 连接字符串
-- `beta.redis_url` — Redis 连接字符串
+`.temp/deploy-config.json` 的 `beta` 字段包含 Beta 环境配置信息。
 
 需要连接 Beta 环境进行调试或集成测试时，从此文件读取。

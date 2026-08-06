@@ -1,0 +1,24 @@
+# Gateway Worker — 路由分发、JWT 验证、CORS
+name = "industrial-gateway"
+main = "src/index.ts"
+compatibility_date = "2025-08-06"
+
+# [vars]
+# JWT_SECRET = ""  # identity-worker 实现后配置
+
+# 路由：所有流量经 Gateway
+# [[routes]]
+# pattern = "api.industrial-planner.local/*"
+# zone_id = ""
+
+# Service Bindings（其他 Worker 实现后逐步启用）
+# [[services]]
+# binding = "TELEMETRY"
+# service = "industrial-telemetry"
+# [[services]]
+# binding = "IDENTITY"
+# service = "industrial-identity"
+
+# 本地开发时，Service Bindings 指向本地运行的 Worker
+[dev]
+port = 8787

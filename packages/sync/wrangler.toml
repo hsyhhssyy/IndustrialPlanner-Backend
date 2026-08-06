@@ -1,0 +1,12 @@
+# Sync Worker — 多端同步与冲突检测（空壳）
+name = "industrial-sync"
+main = "src/index.ts"
+compatibility_date = "2025-08-06"
+
+# [[d1_databases]]
+# binding = "DB"
+# database_name = "sync-db"
+# database_id = ""
+
+[dev]
+port = 8792

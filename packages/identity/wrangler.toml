@@ -1,0 +1,16 @@
+# Identity Worker — 账户与本地认证（空壳）
+name = "industrial-identity"
+main = "src/index.ts"
+compatibility_date = "2025-08-06"
+
+# [[d1_databases]]
+# binding = "DB"
+# database_name = "identity-db"
+# database_id = ""
+#
+# [[kv_namespaces]]
+# binding = "SESSIONS"
+# id = ""
+
+[dev]
+port = 8789
