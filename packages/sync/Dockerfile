@@ -22,10 +22,9 @@ COPY packages/sync/migrations ./packages/sync/migrations
 # ---- runtime stage ----
 FROM node:22-slim
 
-RUN npm install -g pnpm wrangler
-
 WORKDIR /app
 
+# 必须的编译依赖（wrangler dev 底层的 workerd 需要原生模块）
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 make g++ \
     && rm -rf /var/lib/apt/lists/*
@@ -33,6 +32,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/packages ./packages
 COPY pnpm-workspace.yaml pnpm-lock.yaml package.json tsconfig.base.json ./
+
+# 本地安装 wrangler（非全局），确保能使用 node_modules 中编译好的 better-sqlite3
+RUN cd packages/sync && npx pnpm add -w wrangler
 
 # .dev.vars 注入环境变量（LOCAL_DEV_HOST 运行时 -e 覆盖）
 COPY packages/sync/.dev.vars.docker packages/sync/.dev.vars
