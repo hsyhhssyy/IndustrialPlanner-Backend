@@ -1,0 +1,15 @@
+# sync-worker 本地开发容器
+
+# 默认值，可通过 --build-arg 或环境变量覆盖
+ARG LOCAL_DEV_HOST=http://localhost:8080
+ENV LOCAL_DEV_HOST=$LOCAL_DEV_HOST
+
+# 开发凭据（容器内本地使用，不连 Cloudflare）
+ENV COMMIT_TOKEN_SECRET=dev-secret-key-32-bytes-long!!
+ENV R2_ACCESS_KEY_ID=dev
+ENV R2_SECRET_ACCESS_KEY=dev
+ENV R2_ACCOUNT_ID=dev
+ENV R2_BUCKET_NAME=dev
+
+# wrangler dev 端口
+ENV PORT=8080

@@ -1,0 +1,117 @@
+name: Deploy Dev Server
+run-name: Deploy Dev ${{ inputs.tag_name || github.ref_name }}
+
+# 本地开发服务器（wrangler dev + 本地 D1/R2 模拟），部署到 K8s
+# 用途：前端联调测试，不走 Cloudflare Workers 边缘网络
+
+on:
+  push:
+    tags:
+      - 'dev-[0-9]+.[0-9]+.[0-9]+'
+      - 'dev-[0-9]+.[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: '要部署的 tag，例如 dev-0.1.0'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-dev-${{ inputs.tag_name || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    name: Build & Deploy ${{ inputs.tag_name || github.ref_name }}
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ inputs.tag_name || github.ref_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Load deploy config
+        env:
+          DEPLOY_CONFIG: ${{ secrets.DEPLOY_CONFIG }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          config_file="$RUNNER_TEMP/deploy-config.json"
+          printf '%s' "$DEPLOY_CONFIG" > "$config_file"
+
+          registry="$(jq -r '.registry' "$config_file")"
+          username="$(jq -r '.username' "$config_file")"
+          password="$(jq -r '.password' "$config_file")"
+          image_name="$(jq -r '.image_name' "$config_file")"
+          domain="$(jq -r '.beta.domain' "$config_file")"
+          namespace="$(jq -r '.beta.namespace' "$config_file")"
+
+          for var in registry username password image_name domain namespace; do
+            val="${!var}"
+            if [ -z "$val" ] || [ "$val" = 'null' ]; then
+              echo "Missing or null: $var" >&2
+              exit 1
+            fi
+          done
+
+          image="${registry}/${image_name}:${RELEASE_TAG}"
+
+          echo "::add-mask::$password"
+          echo "registry=$registry" >> "$GITHUB_ENV"
+          echo "username=$username" >> "$GITHUB_ENV"
+          echo "image=$image" >> "$GITHUB_ENV"
+          echo "domain=$domain" >> "$GITHUB_ENV"
+          echo "namespace=$namespace" >> "$GITHUB_ENV"
+          {
+            echo 'tags<<EOF'
+            echo "$image"
+            echo "${registry}/${image_name}:dev-latest"
+            echo 'EOF'
+          } >> "$GITHUB_ENV"
+          {
+            echo 'DOCKER_PASSWORD<<EOF'
+            echo "$password"
+            echo 'EOF'
+          } >> "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.registry }}
+          username: ${{ env.username }}
+          password: ${{ env.DOCKER_PASSWORD }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: packages/sync/Dockerfile
+          push: true
+          tags: ${{ env.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Render and apply K8s manifests
+        env:
+          DOMAIN: ${{ env.domain }}
+          NAMESPACE: ${{ env.namespace }}
+          KUBECONFIG_DATA: ${{ secrets.KUBE_CONFIG }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kubeconfig_file="$RUNNER_TEMP/kubeconfig"
+          printf '%s' "$KUBECONFIG_DATA" > "$kubeconfig_file"
+          chmod 600 "$kubeconfig_file"
+          export KUBECONFIG="$kubeconfig_file"
+
+          envsubst < .github/k8s/deployment-dev.yaml | kubectl apply -n "$NAMESPACE" -f -
+          kubectl rollout status deployment/industrial-sync-dev -n "$NAMESPACE" --timeout=120s

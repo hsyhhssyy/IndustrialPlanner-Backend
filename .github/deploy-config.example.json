@@ -1,0 +1,12 @@
+{
+  "_comment": "复制为 deploy-config.json，放入 GitHub Secrets DEPLOY_CONFIG",
+  "registry": "docker.hsyhhssyy.net",
+  "username": "your-username",
+  "password": "your-password",
+  "image_name": "industrial-sync-dev",
+  "beta": {
+    "_comment": "开发服务器复用 beta 配置（前端联调测试用）",
+    "namespace": "amiyabot-beta",
+    "domain": "endfield-api.hsyhhssyy.net"
+  }
+}
