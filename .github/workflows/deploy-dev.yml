@@ -101,6 +101,7 @@ jobs:
 
       - name: Render and apply K8s manifests
         env:
+          IMAGE: ${{ env.image }}
           DOMAIN: ${{ env.domain }}
           NAMESPACE: ${{ env.namespace }}
           KUBECONFIG_DATA: ${{ secrets.KUBE_CONFIG }}
