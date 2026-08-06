@@ -1,4 +1,4 @@
 [submodule ".docs"]
 	path = .docs
 	url = https://github.com/hsyhhssyy/IndustrialPlanner-AIDocument.git
-	branch = backend-v3
+	branch = backend-v3-cf
