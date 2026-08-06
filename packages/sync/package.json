@@ -5,15 +5,25 @@
   "type": "module",
   "main": "./src/index.ts",
   "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
     "lint": "echo ok",
-    "typecheck": "tsc --noEmit"
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "db:migrate:local": "wrangler d1 migrations apply sync-db --local",
+    "db:migrate:remote": "wrangler d1 migrations apply sync-db --remote"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1103.0",
+    "@aws-sdk/s3-request-presigner": "^3.1103.0",
     "@industrial/shared": "workspace:*",
     "hono": "^4.8.0"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250801.0",
+    "@types/node": "^26.1.2",
+    "better-sqlite3": "^13.0.3",
+    "vitest": "^3.2.0",
     "wrangler": "^4.20.0"
   }
 }

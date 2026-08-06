@@ -25,6 +25,17 @@ app.all("/v1/telemetry/*", async (c) => {
   );
 });
 
+// 同步路由 → 转发到 sync-worker
+app.all("/v1/sync/*", async (c) => {
+  if (c.env?.SYNC && typeof (c.env.SYNC as { fetch: unknown }).fetch === "function") {
+    return (c.env.SYNC as { fetch: (r: Request) => Promise<Response> }).fetch(c.req.raw);
+  }
+  return c.json(
+    { error: "not_implemented", message: "同步服务未绑定" },
+    501,
+  );
+});
+
 // 未匹配路由
 app.all("*", (c) => {
   return Errors.notFound(`路径 ${new URL(c.req.url).pathname} 未实现`);

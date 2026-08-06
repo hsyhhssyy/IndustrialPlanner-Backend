@@ -1,18 +1,16 @@
-// Sync Worker 入口（空壳，阶段四实现）
-// 能力范围：revision 条件写入、幂等键、冲突响应
+// Sync Worker 入口 — 组合根
+//
+// 能力范围：cf-sync-v1 协议上传路径（prepare + R2 预签名 PUT + commit）
+// Phase 1：无鉴权，自管资产 meta
 
-import { Hono } from "hono";
-import { withCors, Errors } from "@industrial/shared";
+import { createApp, type SyncEnv } from "./http";
+import { withCors, ANONYMOUS_CORS_HEADERS } from "@industrial/shared";
 
-const app = new Hono();
-
-app.all("*", (c) => {
-  return Errors.internal("Sync Worker 尚未实现");
-});
+const app = createApp();
 
 export default {
-  fetch: async (request: Request, env: Record<string, unknown>) => {
+  fetch: async (request: Request, env: SyncEnv) => {
     const response = await app.fetch(request, env);
-    return withCors(response);
+    return withCors(response, ANONYMOUS_CORS_HEADERS);
   },
 };
