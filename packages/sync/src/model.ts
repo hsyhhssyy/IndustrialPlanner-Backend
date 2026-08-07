@@ -215,3 +215,75 @@ export function validateMutationBatch(
 
   return { ok: true };
 }
+
+// ============================================================================
+// plan 端点类型
+// ============================================================================
+
+// 资产摘要（plan 响应中的每个 asset）
+export interface AssetSummary {
+  assetType: string;
+  assetId: string;
+  revision: number;
+  contentHash: string | null;
+  schemaVersion: number;
+  storageMode: string | null;
+  blobHash: string;
+  byteSize: number;
+  encoding: string;
+  downloadUrl?: string;
+  deletedAt?: string | null;
+}
+
+// plan 响应体
+export interface PlanResponse {
+  head: number;
+  epoch: string;
+  assets: AssetSummary[];
+  serverTime: string;
+}
+
+// ============================================================================
+// check 端点类型
+// ============================================================================
+
+// check 响应体
+export interface CheckResponse {
+  head: number;
+  epoch: string;
+  changed: boolean;
+  updates?: AssetSummary[];
+  serverTime: string;
+}
+
+// ============================================================================
+// reset 端点类型
+// ============================================================================
+
+// reset 响应体
+export interface ResetResponse {
+  ok: boolean;
+  spaceId: string;
+  previousEpoch: string;
+  newEpoch: string;
+}
+
+// ============================================================================
+// downloads:sign 端点类型
+// ============================================================================
+
+// downloads:sign 请求体
+export interface DownloadsSignRequest {
+  blobHashes: string[];
+}
+
+// 单个签名 URL
+export interface SignedUrl {
+  blobHash: string;
+  url: string;
+}
+
+// downloads:sign 响应体
+export interface DownloadsSignResponse {
+  urls: SignedUrl[];
+}

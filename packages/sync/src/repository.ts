@@ -78,6 +78,20 @@ export interface AppliedVersionResult {
   contentHash: string;
 }
 
+// listAssetHeads 返回 — 包含 blob 信息（JOIN sync_asset_versions）
+export interface AssetHeadWithBlob {
+  assetType: string;
+  assetId: string;
+  revision: number;
+  contentHash: string | null;
+  schemaVersion: number;
+  storageMode: string | null;
+  deletedAt: string | null;
+  blobHash: string;
+  byteSize: number;
+  encoding: string;
+}
+
 // ============================================================================
 // Repository 接口
 // ============================================================================
@@ -86,6 +100,7 @@ export interface SyncRepository {
   // Space
   insertSpace(space: SpaceRow): Promise<void>;
   getSpaceHead(spaceId: string): Promise<SpaceRow | null>;
+  resetSpace(spaceId: string, newEpoch: string, previousEpoch: string): Promise<{ previousEpoch: string; newEpoch: string } | null>;
 
   // Asset
   upsertAssetHead(asset: AssetHeadRow): Promise<void>;
@@ -95,6 +110,11 @@ export interface SyncRepository {
     assetType: string,
     assetId: string,
   ): Promise<AssetHeadRow | null>;
+  listAssetHeads(
+    spaceId: string,
+    epoch: string,
+    assetTypes?: string[],
+  ): Promise<AssetHeadWithBlob[]>;
 
   // Idempotency
   getMutationResult(
@@ -205,6 +225,25 @@ export function createRepository(db: D1Database): SyncRepository {
       return rowToSpaceHead(result);
     },
 
+    async resetSpace(
+      spaceId: string,
+      newEpoch: string,
+      previousEpoch: string,
+    ): Promise<{ previousEpoch: string; newEpoch: string } | null> {
+      // 使用 previousEpoch 做 CAS，防止并发重置
+      const result = await db
+        .prepare(
+          `UPDATE sync_spaces
+           SET active_epoch = ?1, head = 0, updated_at = ?2
+           WHERE space_id = ?3 AND active_epoch = ?4`,
+        )
+        .bind(newEpoch, new Date().toISOString(), spaceId, previousEpoch)
+        .run();
+
+      if (result.meta?.changes === 0) return null;
+      return { previousEpoch, newEpoch };
+    },
+
     // Asset
     async upsertAssetHead(asset: AssetHeadRow): Promise<void> {
       await db
@@ -270,6 +309,58 @@ export function createRepository(db: D1Database): SyncRepository {
 
       if (!result) return null;
       return rowToAssetHead(result);
+    },
+
+    async listAssetHeads(
+      spaceId: string,
+      epoch: string,
+      assetTypes?: string[],
+    ): Promise<AssetHeadWithBlob[]> {
+      let sql = `
+        SELECT
+          a.asset_type, a.asset_id, a.revision, a.content_hash,
+          a.schema_version, a.storage_mode, a.deleted_at,
+          COALESCE(v.blob_hash, '') AS blob_hash,
+          COALESCE(v.byte_size, 0) AS byte_size,
+          COALESCE(v.encoding, 'identity') AS encoding
+        FROM sync_assets a
+        LEFT JOIN sync_asset_versions v
+          ON v.space_id = a.space_id
+          AND v.epoch = a.epoch
+          AND v.asset_type = a.asset_type
+          AND v.asset_id = a.asset_id
+          AND v.revision = a.revision
+        WHERE a.space_id = ?1 AND a.epoch = ?2
+      `;
+      const params: unknown[] = [spaceId, epoch];
+
+      if (assetTypes && assetTypes.length > 0) {
+        const placeholders = assetTypes.map(() => "?").join(",");
+        sql += ` AND a.asset_type IN (${placeholders})`;
+        params.push(...assetTypes);
+      }
+
+      sql += " ORDER BY a.asset_type, a.asset_id";
+
+      const result = await db
+        .prepare(sql)
+        .bind(...params)
+        .all<Record<string, unknown>>();
+
+      if (!result.results) return [];
+
+      return result.results.map((row) => ({
+        assetType: row.asset_type as string,
+        assetId: row.asset_id as string,
+        revision: row.revision as number,
+        contentHash: row.content_hash as string | null,
+        schemaVersion: row.schema_version as number,
+        storageMode: row.storage_mode as string | null,
+        deletedAt: row.deleted_at as string | null,
+        blobHash: row.blob_hash as string,
+        byteSize: row.byte_size as number,
+        encoding: row.encoding as string,
+      }));
     },
 
     // Idempotency

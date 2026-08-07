@@ -8,6 +8,7 @@ import { createRepository } from "./repository";
 import { signCommitToken } from "./commit_token";
 import { handleCommit } from "./service";
 import type { SpaceRow } from "./repository";
+import type { PlanResponse, AssetSummary, CheckResponse, ResetResponse, DownloadsSignResponse } from "./model";
 
 function execMigrationSync(db: D1Database, sql: string) {
   const cleaned = sql.split("\n").filter((l) => !l.trimStart().startsWith("--")).join("\n");
@@ -204,5 +205,343 @@ describe("E2E — 上传全流程（真实 D1 + R2）", () => {
 
     expect(rB.status).toBe("conflict");
     expect(rB.conflicts?.[0]?.reason).toBe("revision-mismatch");
+  });
+});
+
+// ============================================================================
+// plan endpoint E2E
+// ============================================================================
+describe("E2E — plan 端点（GET /v1/sync/spaces/:spaceId/plan）", () => {
+  const S = "plan-space", E = "epoch-1", N = Date.now(), P = "2026-08-07T00:00:00Z";
+  const env = () => ({
+    DB: db, BLOB_STORE: r2,
+    PROTOCOL_VERSION: "cf-sync-v1", MAX_MUTATIONS_PER_BATCH: "32", MAX_METADATA_SIZE: "262144",
+    COMMIT_TOKEN_SECRET: MOCK_SECRET,
+    R2_ACCESS_KEY_ID: "", R2_SECRET_ACCESS_KEY: "", R2_ACCOUNT_ID: "", R2_BUCKET_NAME: "",
+    LOCAL_DEV_HOST: "http://localhost:8792",
+  });
+
+  beforeAll(async () => {
+    await createRepository(db).insertSpace({
+      spaceId: S, activeEpoch: E, head: 0, minRetainedHead: 0, updatedAt: P,
+    } satisfies SpaceRow);
+
+    // 上传一个资产，使 plan 有数据可返回
+    const repo = createRepository(db);
+    const h = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0";
+    await r2.put(`sync/v1/${S}/${E}/blobs/sha256/a1/${h}`, "plan-asset-data");
+
+    const token = await signCommitToken({
+      spaceId: S, epoch: E, clientBatchId: "plan-b1", observedHead: 0,
+      mutations: [{ clientMutationId: "plan-cm1", assetType: "bp", assetId: "bp-1", baseRevision: null }],
+      expiresAt: N + 300_000,
+    }, MOCK_SECRET);
+
+    await handleCommit(S, E, token, [{
+      clientMutationId: "plan-cm1", assetType: "bp", assetId: "bp-1",
+      baseRevision: null, baseContentHash: null, metadata: "{}",
+      blobHash: h, blobByteSize: 4, storageMode: "full",
+      schemaVersion: 1, encoding: "identity", writerAppVersion: "1.0.0", writerBuildId: "b1",
+    }], { repo, commitTokenSecret: MOCK_SECRET, r2Bucket: r2, now: N, presentTime: P });
+  });
+
+  it("GET plan → 200，返回 space head + asset 列表", async () => {
+    const w = await import("./index");
+    const res = await w.default.fetch(
+      new Request(`https://localhost/v1/sync/spaces/${S}/plan`),
+      env(),
+    );
+    expect(res.status).toBe(200);
+
+    const body = await res.json() as PlanResponse;
+    expect(body.head).toBe(1);
+    expect(body.epoch).toBe(E);
+    expect(body.assets).toBeDefined();
+    expect(body.assets.length).toBeGreaterThanOrEqual(1);
+
+    const bp1 = body.assets.find((a: AssetSummary) => a.assetId === "bp-1");
+    expect(bp1).toBeDefined();
+    expect(bp1!.assetType).toBe("bp");
+    expect(bp1!.revision).toBe(1);
+    expect(bp1!.contentHash).toBe("a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0");
+    expect(bp1!.schemaVersion).toBe(1);
+    expect(bp1!.storageMode).toBe("full");
+    // 本地开发模式：downloadUrl 应为本地直传 URL
+    expect(bp1!.downloadUrl).toContain("/blobs/");
+    expect(bp1!.downloadUrl).toContain("sha256");
+  });
+
+  it("GET plan with assetTypes filter → 只返回匹配类型", async () => {
+    const w = await import("./index");
+    const res = await w.default.fetch(
+      new Request(`https://localhost/v1/sync/spaces/${S}/plan?assetTypes=bp`),
+      env(),
+    );
+    expect(res.status).toBe(200);
+
+    const body = await res.json() as PlanResponse;
+    expect(body.assets.length).toBeGreaterThanOrEqual(1);
+    expect(body.assets.every((a: AssetSummary) => a.assetType === "bp")).toBe(true);
+  });
+
+  it("GET plan with non-matching assetTypes → 返回空列表", async () => {
+    const w = await import("./index");
+    const res = await w.default.fetch(
+      new Request(`https://localhost/v1/sync/spaces/${S}/plan?assetTypes=base`),
+      env(),
+    );
+    expect(res.status).toBe(200);
+
+    const body = await res.json() as PlanResponse;
+    expect(body.assets).toHaveLength(0);
+  });
+
+  it("GET plan for non-existent space → 404", async () => {
+    const w = await import("./index");
+    const res = await w.default.fetch(
+      new Request("https://localhost/v1/sync/spaces/nonexistent/plan"),
+      env(),
+    );
+    expect(res.status).toBe(404);
+  });
+});
+
+// ============================================================================
+// check endpoint E2E
+// ============================================================================
+describe("E2E — check 端点（GET /v1/sync/spaces/:spaceId/check）", () => {
+  const S = "check-space", E = "epoch-1", N = Date.now(), P = "2026-08-07T00:00:00Z";
+  const env = () => ({
+    DB: db, BLOB_STORE: r2,
+    PROTOCOL_VERSION: "cf-sync-v1", MAX_MUTATIONS_PER_BATCH: "32", MAX_METADATA_SIZE: "262144",
+    COMMIT_TOKEN_SECRET: MOCK_SECRET,
+    R2_ACCESS_KEY_ID: "", R2_SECRET_ACCESS_KEY: "", R2_ACCOUNT_ID: "", R2_BUCKET_NAME: "",
+    LOCAL_DEV_HOST: "http://localhost:8792",
+  });
+
+  beforeAll(async () => {
+    await createRepository(db).insertSpace({
+      spaceId: S, activeEpoch: E, head: 0, minRetainedHead: 0, updatedAt: P,
+    } satisfies SpaceRow);
+
+    // 上传一个资产到 head=1
+    const repo = createRepository(db);
+    const h = "c1c2c3c4c5c6c7c8c9c0d1d2d3d4d5d6d7d8d9d0";
+    await r2.put(`sync/v1/${S}/${E}/blobs/sha256/c1/${h}`, "check-data");
+
+    const token = await signCommitToken({
+      spaceId: S, epoch: E, clientBatchId: "check-b1", observedHead: 0,
+      mutations: [{ clientMutationId: "check-cm1", assetType: "bp", assetId: "chk-1", baseRevision: null }],
+      expiresAt: N + 300_000,
+    }, MOCK_SECRET);
+
+    await handleCommit(S, E, token, [{
+      clientMutationId: "check-cm1", assetType: "bp", assetId: "chk-1",
+      baseRevision: null, baseContentHash: null, metadata: "{}",
+      blobHash: h, blobByteSize: 4, storageMode: "full",
+      schemaVersion: 1, encoding: "identity", writerAppVersion: "1.0.0", writerBuildId: "b1",
+    }], { repo, commitTokenSecret: MOCK_SECRET, r2Bucket: r2, now: N, presentTime: P });
+  });
+
+  it("GET check with knownHead=1 → changed=false", async () => {
+    const w = await import("./index");
+    const res = await w.default.fetch(
+      new Request(`https://localhost/v1/sync/spaces/${S}/check?knownHead=1`),
+      env(),
+    );
+    expect(res.status).toBe(200);
+
+    const body = await res.json() as CheckResponse;
+    expect(body.head).toBe(1);
+    expect(body.epoch).toBe(E);
+    expect(body.changed).toBe(false);
+    expect(body.serverTime).toBeDefined();
+  });
+
+  it("GET check with knownHead=0 → changed=true", async () => {
+    const w = await import("./index");
+    const res = await w.default.fetch(
+      new Request(`https://localhost/v1/sync/spaces/${S}/check?knownHead=0`),
+      env(),
+    );
+    expect(res.status).toBe(200);
+
+    const body = await res.json() as CheckResponse;
+    expect(body.changed).toBe(true);
+    // 客户端应回退到 plan
+    expect(body.updates).toBeUndefined();
+  });
+
+  it("GET check with knownHead > current head → changed=false", async () => {
+    const w = await import("./index");
+    const res = await w.default.fetch(
+      new Request(`https://localhost/v1/sync/spaces/${S}/check?knownHead=999`),
+      env(),
+    );
+    expect(res.status).toBe(200);
+
+    const body = await res.json() as CheckResponse;
+    expect(body.changed).toBe(false);
+  });
+
+  it("GET check without knownHead → changed=true", async () => {
+    const w = await import("./index");
+    const res = await w.default.fetch(
+      new Request(`https://localhost/v1/sync/spaces/${S}/check`),
+      env(),
+    );
+    expect(res.status).toBe(200);
+
+    const body = await res.json() as CheckResponse;
+    expect(body.changed).toBe(true);
+  });
+
+  it("GET check for non-existent space → 404", async () => {
+    const w = await import("./index");
+    const res = await w.default.fetch(
+      new Request("https://localhost/v1/sync/spaces/nonexistent/check"),
+      env(),
+    );
+    expect(res.status).toBe(404);
+  });
+});
+
+// ============================================================================
+// reset endpoint E2E
+// ============================================================================
+describe("E2E — reset 端点（POST /v1/sync/spaces/:spaceId/reset）", () => {
+  const S = "reset-space", E = "epoch-1", N = Date.now(), P = "2026-08-07T00:00:00Z";
+  const env = () => ({
+    DB: db, BLOB_STORE: r2,
+    PROTOCOL_VERSION: "cf-sync-v1", MAX_MUTATIONS_PER_BATCH: "32", MAX_METADATA_SIZE: "262144",
+    COMMIT_TOKEN_SECRET: MOCK_SECRET,
+    R2_ACCESS_KEY_ID: "", R2_SECRET_ACCESS_KEY: "", R2_ACCOUNT_ID: "", R2_BUCKET_NAME: "",
+    LOCAL_DEV_HOST: "http://localhost:8792",
+  });
+
+  beforeAll(async () => {
+    await createRepository(db).insertSpace({
+      spaceId: S, activeEpoch: E, head: 5, minRetainedHead: 0, updatedAt: P,
+    } satisfies SpaceRow);
+  });
+
+  it("POST reset → epoch 递增，head 重置为 0", async () => {
+    const w = await import("./index");
+    const res = await w.default.fetch(
+      new Request(`https://localhost/v1/sync/spaces/${S}/reset`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+      }),
+      env(),
+    );
+    expect(res.status).toBe(200);
+
+    const body = await res.json() as ResetResponse;
+    expect(body.ok).toBe(true);
+    expect(body.spaceId).toBe(S);
+    expect(body.newEpoch).not.toBe(E);
+    expect(body.previousEpoch).toBe(E);
+
+    // 验证 DB
+    const space = await createRepository(db).getSpaceHead(S);
+    expect(space).not.toBeNull();
+    expect(space!.activeEpoch).not.toBe(E);
+    expect(space!.head).toBe(0);
+  });
+
+  it("POST reset for non-existent space → 404", async () => {
+    const w = await import("./index");
+    const res = await w.default.fetch(
+      new Request("https://localhost/v1/sync/spaces/nonexistent/reset", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+      }),
+      env(),
+    );
+    expect(res.status).toBe(404);
+  });
+});
+
+// ============================================================================
+// downloads:sign endpoint E2E
+// ============================================================================
+describe("E2E — downloads:sign 端点（POST /v1/sync/spaces/:spaceId/downloads:sign）", () => {
+  const S = "dlsign-space", E = "epoch-1", P = "2026-08-07T00:00:00Z";
+  const env = () => ({
+    DB: db, BLOB_STORE: r2,
+    PROTOCOL_VERSION: "cf-sync-v1", MAX_MUTATIONS_PER_BATCH: "32", MAX_METADATA_SIZE: "262144",
+    COMMIT_TOKEN_SECRET: MOCK_SECRET,
+    R2_ACCESS_KEY_ID: "", R2_SECRET_ACCESS_KEY: "", R2_ACCOUNT_ID: "", R2_BUCKET_NAME: "",
+    LOCAL_DEV_HOST: "http://localhost:8792",
+  });
+
+  beforeAll(async () => {
+    await createRepository(db).insertSpace({
+      spaceId: S, activeEpoch: E, head: 0, minRetainedHead: 0, updatedAt: P,
+    } satisfies SpaceRow);
+  });
+
+  it("POST downloads:sign → 返回本地下载 URL", async () => {
+    const w = await import("./index");
+    const hash = "d1d2d3d4d5d6d7d8d9d0e1e2e3e4e5e6e7e8e9e0";
+    const res = await w.default.fetch(
+      new Request(`https://localhost/v1/sync/spaces/${S}/downloads:sign`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ blobHashes: [hash] }),
+      }),
+      env(),
+    );
+    expect(res.status).toBe(200);
+
+    const body = await res.json() as DownloadsSignResponse;
+    expect(body.urls).toBeDefined();
+    expect(body.urls).toHaveLength(1);
+    expect(body.urls[0].blobHash).toBe(hash);
+    // 本地模式：localDevHost URL
+    expect(body.urls[0].url).toContain("/blobs/");
+    expect(body.urls[0].url).toContain("sha256");
+  });
+
+  it("POST downloads:sign empty blobHashes → 返回空数组", async () => {
+    const w = await import("./index");
+    const res = await w.default.fetch(
+      new Request(`https://localhost/v1/sync/spaces/${S}/downloads:sign`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ blobHashes: [] }),
+      }),
+      env(),
+    );
+    expect(res.status).toBe(200);
+
+    const body = await res.json() as DownloadsSignResponse;
+    expect(body.urls).toHaveLength(0);
+  });
+
+  it("POST downloads:sign missing blobHashes → 400", async () => {
+    const w = await import("./index");
+    const res = await w.default.fetch(
+      new Request(`https://localhost/v1/sync/spaces/${S}/downloads:sign`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      }),
+      env(),
+    );
+    expect(res.status).toBe(400);
+  });
+
+  it("POST downloads:sign for non-existent space → 404", async () => {
+    const w = await import("./index");
+    const res = await w.default.fetch(
+      new Request("https://localhost/v1/sync/spaces/nonexistent/downloads:sign", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ blobHashes: ["d1d2d3d4d5d6d7d8d9d0e1e2e3e4e5e6e7e8e9e0"] }),
+      }),
+      env(),
+    );
+    expect(res.status).toBe(404);
   });
 });

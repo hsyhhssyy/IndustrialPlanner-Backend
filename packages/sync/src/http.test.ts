@@ -90,44 +90,6 @@ describe("http routes", () => {
     });
   });
 
-  describe("未实现端点返回 501", () => {
-    it("GET /v1/sync/spaces/:spaceId/check → 501", async () => {
-      const req = new Request(
-        "https://localhost/v1/sync/spaces/test/check",
-      );
-      const res = await app.fetch(req, testEnv());
-      expect(res.status).toBe(501);
-      const body = await res.json() as { error: string };
-      expect(body.error).toBe("not_implemented");
-    });
-
-    it("GET /v1/sync/spaces/:spaceId/plan → 501", async () => {
-      const req = new Request(
-        "https://localhost/v1/sync/spaces/test/plan",
-      );
-      const res = await app.fetch(req, testEnv());
-      expect(res.status).toBe(501);
-    });
-
-    it("POST /v1/sync/spaces/:spaceId/downloads:sign → 501", async () => {
-      const req = new Request(
-        "https://localhost/v1/sync/spaces/test/downloads:sign",
-        { method: "POST" },
-      );
-      const res = await app.fetch(req, testEnv());
-      expect(res.status).toBe(501);
-    });
-
-    it("POST /v1/sync/spaces/:spaceId/reset → 501", async () => {
-      const req = new Request(
-        "https://localhost/v1/sync/spaces/test/reset",
-        { method: "POST" },
-      );
-      const res = await app.fetch(req, testEnv());
-      expect(res.status).toBe(501);
-    });
-  });
-
   describe("POST /v1/sync/spaces/:spaceId/mutations", () => {
     it("未知 action 返回 400", async () => {
       const req = new Request(
@@ -188,14 +150,6 @@ describe("http routes", () => {
   describe("CORS 头出现在所有响应中", () => {
     it("404 响应含 CORS 头", async () => {
       const req = new Request("https://localhost/unknown");
-      const res = await app.fetch(req, testEnv());
-      expect(res.headers.get("access-control-allow-origin")).toBe("*");
-    });
-
-    it("501 响应含 CORS 头", async () => {
-      const req = new Request(
-        "https://localhost/v1/sync/spaces/test/check",
-      );
       const res = await app.fetch(req, testEnv());
       expect(res.headers.get("access-control-allow-origin")).toBe("*");
     });

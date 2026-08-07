@@ -7,12 +7,11 @@ run-name: Deploy Dev ${{ inputs.tag_name || github.ref_name }}
 on:
   push:
     tags:
-      - 'dev-[0-9]+.[0-9]+.[0-9]+'
-      - 'dev-[0-9]+.[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+.[0-9]+-Dev[0-9]+'
   workflow_dispatch:
     inputs:
       tag_name:
-        description: '要部署的 tag，例如 dev-0.1.0'
+        description: '要部署的 tag，例如 v0.1.0.1-Dev22'
         required: true
         type: string
 

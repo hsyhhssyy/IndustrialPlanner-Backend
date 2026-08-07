@@ -1,11 +1,11 @@
-// 服务层 — 用例编排（handlePrepare / handleCommit）
+// 服务层 — 用例编排（handlePrepare / handleCommit / handlePlan）
 //
 // 职责：协调 repository、commit_token、presigned_url 完成业务逻辑。
 // 不直接访问 D1/R2，通过注入的依赖接口操作。
 
 import type { SyncRepository, AssetHeadRow, CommitVersionInput } from "./repository";
 import type { PresignedUrlConfig } from "./presigned_url";
-import { generatePresignedUploadUrl } from "./presigned_url";
+import { generatePresignedUploadUrl, generatePresignedDownloadUrl } from "./presigned_url";
 import {
   signCommitToken,
   verifyCommitToken,
@@ -18,6 +18,11 @@ import type {
   MutationUpload,
   AlreadyAppliedMutation,
   ConflictItem,
+  PlanResponse,
+  AssetSummary,
+  CheckResponse,
+  ResetResponse,
+  DownloadsSignResponse,
 } from "./model";
 
 // ============================================================================
@@ -466,4 +471,168 @@ export async function handleCommit(
     head: newHead,
     serverTime: deps.presentTime,
   };
+}
+
+// ============================================================================
+// handlePlan
+// ============================================================================
+
+export interface HandlePlanDeps {
+  repo: SyncRepository;
+  presignedUrlConfig: PresignedUrlConfig;
+  localDevHost?: string;
+}
+
+export async function handlePlan(
+  spaceId: string,
+  assetTypes: string[],
+  deps: HandlePlanDeps,
+): Promise<PlanResponse | null> {
+  const space = await deps.repo.getSpaceHead(spaceId);
+  if (!space) return null;
+
+  const rows = await deps.repo.listAssetHeads(spaceId, space.activeEpoch, assetTypes.length > 0 ? assetTypes : undefined);
+
+  const assets: AssetSummary[] = [];
+  for (const row of rows) {
+    let downloadUrl: string | undefined;
+    if (row.blobHash) {
+      if (deps.localDevHost) {
+        const prefix = row.blobHash.substring(0, 2);
+        downloadUrl = `${deps.localDevHost}/v1/sync/spaces/${encodeURIComponent(spaceId)}/blobs/${encodeURIComponent(space.activeEpoch)}/sha256/${prefix}/${encodeURIComponent(row.blobHash)}`;
+      } else if (deps.presignedUrlConfig.accessKeyId) {
+        try {
+          downloadUrl = await generatePresignedDownloadUrl(
+            deps.presignedUrlConfig,
+            spaceId,
+            space.activeEpoch,
+            row.blobHash,
+          );
+        } catch {
+          // S3 失败不阻塞
+        }
+      }
+    }
+
+    assets.push({
+      assetType: row.assetType,
+      assetId: row.assetId,
+      revision: row.revision,
+      contentHash: row.contentHash,
+      schemaVersion: row.schemaVersion,
+      storageMode: row.storageMode,
+      blobHash: row.blobHash,
+      byteSize: row.byteSize,
+      encoding: row.encoding,
+      downloadUrl,
+      deletedAt: row.deletedAt,
+    });
+  }
+
+  return {
+    head: space.head,
+    epoch: space.activeEpoch,
+    assets,
+    serverTime: new Date().toISOString(),
+  };
+}
+
+// ============================================================================
+// handleCheck
+// ============================================================================
+
+export interface HandleCheckDeps {
+  repo: SyncRepository;
+}
+
+export async function handleCheck(
+  spaceId: string,
+  knownHead: number | null,
+  deps: HandleCheckDeps,
+): Promise<CheckResponse | null> {
+  const space = await deps.repo.getSpaceHead(spaceId);
+  if (!space) return null;
+
+  const changed = knownHead === null || knownHead < space.head;
+
+  return {
+    head: space.head,
+    epoch: space.activeEpoch,
+    changed,
+    serverTime: new Date().toISOString(),
+  };
+}
+
+// ============================================================================
+// handleReset
+// ============================================================================
+
+export interface HandleResetDeps {
+  repo: SyncRepository;
+}
+
+export async function handleReset(
+  spaceId: string,
+  deps: HandleResetDeps,
+): Promise<ResetResponse | null> {
+  const space = await deps.repo.getSpaceHead(spaceId);
+  if (!space) return null;
+
+  // epoch 递增：epoch-N → epoch-(N+1)
+  const match = space.activeEpoch.match(/^(.+-)(\d+)$/);
+  const newEpoch = match
+    ? `${match[1]}${parseInt(match[2], 10) + 1}`
+    : `${space.activeEpoch}-reset-${Date.now()}`;
+
+  const result = await deps.repo.resetSpace(spaceId, newEpoch, space.activeEpoch);
+  if (!result) return null;
+
+  return {
+    ok: true,
+    spaceId,
+    previousEpoch: result.previousEpoch,
+    newEpoch: result.newEpoch,
+  };
+}
+
+// ============================================================================
+// handleDownloadsSign
+// ============================================================================
+
+export interface HandleDownloadsSignDeps {
+  repo: SyncRepository;
+  presignedUrlConfig: PresignedUrlConfig;
+  localDevHost?: string;
+}
+
+export async function handleDownloadsSign(
+  spaceId: string,
+  blobHashes: string[],
+  deps: HandleDownloadsSignDeps,
+): Promise<DownloadsSignResponse | null> {
+  const space = await deps.repo.getSpaceHead(spaceId);
+  if (!space) return null;
+
+  const urls: DownloadsSignResponse["urls"] = [];
+  for (const blobHash of blobHashes) {
+    let url: string | undefined;
+    if (deps.localDevHost) {
+      const prefix = blobHash.substring(0, 2);
+      url = `${deps.localDevHost}/v1/sync/spaces/${encodeURIComponent(spaceId)}/blobs/${encodeURIComponent(space.activeEpoch)}/sha256/${prefix}/${encodeURIComponent(blobHash)}`;
+    } else if (deps.presignedUrlConfig.accessKeyId) {
+      try {
+        url = await generatePresignedDownloadUrl(
+          deps.presignedUrlConfig,
+          spaceId,
+          space.activeEpoch,
+          blobHash,
+        );
+      } catch {
+        // S3 失败不阻塞
+      }
+    }
+    urls.push({ blobHash, url: url ?? "" });
+  }
+
+  return { urls };
 }

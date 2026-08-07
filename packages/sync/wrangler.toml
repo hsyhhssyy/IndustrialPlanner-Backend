@@ -7,7 +7,7 @@ compatibility_date = "2025-08-06"
 [[d1_databases]]
 binding = "DB"
 database_name = "sync-db"
-database_id = "00000000-0000-0000-0000-000000000000"  # 本地开发占位 UUID
+database_id = "34197a80-811a-4e06-bbc8-c633b8db1044"
 
 # R2 存储：不可变 payload
 [[r2_buckets]]

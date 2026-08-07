@@ -7,15 +7,12 @@ compatibility_date = "2025-08-06"
 [[d1_databases]]
 binding = "DB"
 database_name = "telemetry-db"
-database_id = ""  # wrangler d1 create 后填写
+database_id = "b77bba55-8093-48c0-9007-41b59029ad04"
 
 # KV 命名空间：限流计数器
 [[kv_namespaces]]
 binding = "RATE_LIMIT"
-id = ""  # wrangler kv:namespace create 后填写
-
-[[kv_namespaces]]
-binding = "RATE_LIMIT"
+id = "8cd9e8680ddb41d281f0c9c22641a3c3"
 preview_id = "telemetry-rate-limit-preview"  # 本地开发使用
 
 # 路由（生产环境由 gateway 转发，这里用于独立测试）

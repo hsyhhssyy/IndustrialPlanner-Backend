@@ -3,7 +3,7 @@
 // 使用 S3 API 生成预签名 PUT URL，前端直传 R2。
 // R2 binding 不支持生成预签名 URL，因此通过 S3 API 实现。
 
-import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
 export interface PresignedUrlConfig {
@@ -53,5 +53,33 @@ export async function generatePresignedUploadUrl(
 
   const url = await getSignedUrl(s3, command, { expiresIn: 300 });
 
+  return url;
+}
+
+// 生成预签名下载 URL
+export async function generatePresignedDownloadUrl(
+  config: PresignedUrlConfig,
+  spaceId: string,
+  epoch: string,
+  blobHash: string,
+): Promise<string> {
+  const prefix = blobHash.substring(0, 2);
+  const key = `sync/v1/${spaceId}/${epoch}/blobs/sha256/${prefix}/${blobHash}`;
+
+  const s3 = new S3Client({
+    region: "auto",
+    endpoint: `https://${config.accountId}.r2.cloudflarestorage.com`,
+    credentials: {
+      accessKeyId: config.accessKeyId,
+      secretAccessKey: config.secretAccessKey,
+    },
+  });
+
+  const command = new GetObjectCommand({
+    Bucket: config.bucketName,
+    Key: key,
+  });
+
+  const url = await getSignedUrl(s3, command, { expiresIn: 3600 });
   return url;
 }
