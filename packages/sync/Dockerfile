@@ -24,25 +24,26 @@ FROM node:22-slim
 
 WORKDIR /app
 
-# 必须的编译依赖（wrangler dev 底层的 workerd 需要原生模块）
+# 必需的系统依赖（better-sqlite3 / workerd 需要）
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 make g++ \
     && rm -rf /var/lib/apt/lists/*
 
+# 从 build 阶段复制完整的 node_modules（含 wrangler + better-sqlite3）
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/packages ./packages
 COPY pnpm-workspace.yaml pnpm-lock.yaml package.json tsconfig.base.json ./
 
-# 本地安装 wrangler（非全局），确保能使用 node_modules 中编译好的 better-sqlite3
-RUN cd packages/sync && npx pnpm add -w wrangler
-
 # .dev.vars 注入环境变量（LOCAL_DEV_HOST 运行时 -e 覆盖）
 COPY packages/sync/.dev.vars.docker packages/sync/.dev.vars
+
+# NODE_PATH 让 npx 在项目内找到 wrangler
+ENV PATH="/app/node_modules/.bin:${PATH}"
 
 EXPOSE 8080
 
 CMD ["bash", "-c", "\
   cd packages/sync && \
-  npx wrangler d1 migrations apply sync-db --local --persist-to /data && \
-  exec npx wrangler dev --ip 0.0.0.0 --port 8080 --persist-to /data \
+  wrangler d1 migrations apply sync-db --local --persist-to /data && \
+  exec wrangler dev --ip 0.0.0.0 --port 8080 --persist-to /data \
   "]
