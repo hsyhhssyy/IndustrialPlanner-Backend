@@ -96,8 +96,7 @@ jobs:
           file: packages/sync/Dockerfile
           push: true
           tags: ${{ env.tags }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          no-cache: true
 
       - name: Render and apply K8s manifests
         env:
