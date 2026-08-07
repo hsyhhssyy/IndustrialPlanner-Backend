@@ -1,38 +1,103 @@
-name: Deploy Dev Server
-run-name: Deploy Dev ${{ inputs.tag_name || github.ref_name }}
-
-# 本地开发服务器（wrangler dev + 本地 D1/R2 模拟），部署到 K8s
-# 用途：前端联调测试，不走 Cloudflare Workers 边缘网络
+name: Deploy
+run-name: Deploy ${{ github.ref_name }}
 
 on:
   push:
     tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+.[0-9]+-Beta[0-9]+'
       - 'v[0-9]+.[0-9]+.[0-9]+.[0-9]+-Dev[0-9]+'
   workflow_dispatch:
     inputs:
-      tag_name:
-        description: '要部署的 tag，例如 v0.1.0.1-Dev22'
-        required: true
-        type: string
+      deploy_cf:
+        description: '部署到 Cloudflare Workers'
+        type: boolean
+        default: false
+      deploy_k8s:
+        description: '部署到 K8s（Docker 构建）'
+        type: boolean
+        default: true
 
 permissions:
   contents: read
 
 concurrency:
-  group: deploy-dev-${{ inputs.tag_name || github.ref_name }}
+  group: deploy-${{ github.ref_name }}
   cancel-in-progress: false
 
 jobs:
-  build-and-deploy:
-    name: Build & Deploy ${{ inputs.tag_name || github.ref_name }}
+  # ── 判断是否为正式版 ──
+  is-release:
+    name: Determine release type
     runs-on: ubuntu-latest
-    env:
-      RELEASE_TAG: ${{ inputs.tag_name || github.ref_name }}
+    outputs:
+      is_release: ${{ steps.check.outputs.is_release }}
+    steps:
+      - id: check
+        shell: bash
+        run: |
+          ref="${{ github.ref_name }}"
+          if [[ "$ref" =~ ^v[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "is_release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ── Cloudflare Workers 部署（正式版 tag 或手动勾选） ──
+  deploy-cf:
+    name: CF Workers
+    needs: is-release
+    if: |
+      (needs.is-release.outputs.is_release == 'true' && github.event_name == 'push')
+      || (github.event_name == 'workflow_dispatch' && inputs.deploy_cf)
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          node-version: '22'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Test
+        run: pnpm test
+
+      - name: Deploy Workers
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        shell: bash
+        run: |
+          pnpm --filter @industrial/gateway exec -- npx wrangler deploy
+          pnpm --filter @industrial/sync exec -- npx wrangler deploy
+          pnpm --filter @industrial/telemetry exec -- npx wrangler deploy
+          pnpm --filter @industrial/identity exec -- npx wrangler deploy
+          pnpm --filter @industrial/oauth exec -- npx wrangler deploy
+          pnpm --filter @industrial/assets exec -- npx wrangler deploy
+
+  # ── K8s 部署（所有 tag：正式版与 CF 并行，Beta/Dev 单独跑） ──
+  deploy-k8s:
+    name: K8s
+    needs: is-release
+    if: |
+      (github.event_name == 'push')
+      || (github.event_name == 'workflow_dispatch' && inputs.deploy_k8s)
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Load deploy config
         env:
@@ -66,12 +131,20 @@ jobs:
           echo "image=$image" >> "$GITHUB_ENV"
           echo "domain=$domain" >> "$GITHUB_ENV"
           echo "namespace=$namespace" >> "$GITHUB_ENV"
+
+          if [[ "${{ github.ref_name }}" =~ Beta|Dev ]]; then
+            extra_tag="${registry}/${image_name}:dev-latest"
+          else
+            extra_tag="${registry}/${image_name}:latest"
+          fi
+
           {
             echo 'tags<<EOF'
             echo "$image"
-            echo "${registry}/${image_name}:dev-latest"
+            echo "$extra_tag"
             echo 'EOF'
           } >> "$GITHUB_ENV"
+
           {
             echo 'DOCKER_PASSWORD<<EOF'
             echo "$password"
