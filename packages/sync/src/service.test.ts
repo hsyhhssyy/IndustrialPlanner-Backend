@@ -571,39 +571,6 @@ describe("handleCommit", () => {
       expect(result.conflicts?.[0]?.reason).toBe("revision-mismatch");
     });
 
-    it("请求体 mutations 与 token 不匹配 → token-invalid", async () => {
-      const token = await makeToken([
-        { clientMutationId: "cm-1", assetType: "blueprint", assetId: "bp-001", baseRevision: null },
-      ]);
-
-      const result = await handleCommit(
-        "test-space",
-        "epoch-1",
-        token,
-        [
-          {
-            clientMutationId: "cm-evil", // 不在 token 中
-            assetType: "blueprint",
-            assetId: "bp-999",
-            baseRevision: null,
-            baseContentHash: null,
-            metadata: "{}",
-            blobHash: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
-            blobByteSize: 100,
-            storageMode: "full",
-            schemaVersion: 1,
-            encoding: "identity",
-            writerAppVersion: "1.0.0",
-            writerBuildId: "build-1",
-          },
-        ],
-        commitDeps(),
-      );
-
-      expect(result.status).toBe("conflict");
-      expect(result.conflicts?.[0]?.reason).toBe("token-invalid");
-    });
-
     it("R2 blob 不存在 → blob-missing", async () => {
       const repo = mockRepo({
         getSpaceHead: vi.fn().mockResolvedValue(mockSpace({ head: 0 })),

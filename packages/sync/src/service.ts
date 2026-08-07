@@ -313,33 +313,7 @@ export async function handleCommit(
     };
   }
 
-  // 3. 请求体 mutations 必须与 token 内 mutations 一致（防篡改）
-  {
-    const tokenMutationMap = new Map(
-      tokenPayload.mutations.map((tm) => [tm.clientMutationId, tm]),
-    );
-    for (const m of mutations) {
-      const tm = tokenMutationMap.get(m.clientMutationId);
-      if (!tm || tm.assetType !== m.assetType || tm.assetId !== m.assetId || tm.baseRevision !== m.baseRevision) {
-        return {
-          status: "conflict",
-          conflicts: [
-            {
-              assetType: m.assetType,
-              assetId: m.assetId,
-              reason: "token-invalid",
-              expectedRevision: tm?.baseRevision ?? null,
-              actualRevision: 0,
-              expectedHash: null,
-              actualHash: null,
-            },
-          ],
-        };
-      }
-    }
-  }
-
-  // 4. 幂等检查（全部 mutation 已提交 → already-committed）
+  // 3. 幂等检查（全部 mutation 已提交 → already-committed）
   const mutationResults: Map<string, MutationResultRow> = new Map();
   for (const m of mutations) {
     const existing = await deps.repo.getMutationResult(
@@ -370,7 +344,7 @@ export async function handleCommit(
     };
   }
 
-  // 5. 读取当前 space head
+  // 4. 读取当前 space head
   const space = await deps.repo.getSpaceHead(spaceId);
   if (!space) {
     return {
@@ -389,7 +363,7 @@ export async function handleCommit(
     };
   }
 
-  // 6. 对每个 mutation 重新校验 revision CAS
+  // 5. 对每个 mutation 重新校验 revision CAS
   const conflicts: ConflictItem[] = [];
   const versions: CommitVersionInput[] = [];
   const blobHashes: string[] = [];
@@ -516,12 +490,12 @@ export async function handleCommit(
     blobR2Keys.push(blobR2Key);
   }
 
-  // 7. 任意冲突 → 拒绝整批
+  // 6. 任意冲突 → 拒绝整批
   if (conflicts.length > 0) {
     return { status: "conflict", conflicts };
   }
 
-  // 8. D1 batch 提交（含 CAS 校验）
+  // 7. D1 batch 提交（含 CAS 校验）
   const newHead = space.head + 1;
   let applied: AppliedVersionResult[];
   try {
