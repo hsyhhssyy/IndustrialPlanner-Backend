@@ -126,9 +126,11 @@ export async function handlePrepare(
     console.log(`[prepare] space=${spaceId} asset=${m.assetType}/${m.assetId} baseRev=${m.baseRevision} baseHash=${(m.baseContentHash||'null').slice(0,12)} currentHead=${currentHead ? 'rev='+currentHead.revision : 'NONE'}`);
 
     // 3c. CAS 校验
-    if (m.baseRevision !== null || m.baseContentHash !== null) {
+    // baseRevision === null 表示客户端声明这是新建资产 — 直接通过 CAS
+    // baseContentHash 单独存在时不触发 CAS（它只在 baseRevision !== null 时有意义）
+    if (m.baseRevision !== null) {
       if (!currentHead) {
-        // 客户端以为资产存在，但远端不存在 → revision mismatch
+        // 客户端以为资产存在，但远端不存在
         conflicts.push({
           assetType: m.assetType,
           assetId: m.assetId,
@@ -142,10 +144,7 @@ export async function handlePrepare(
       }
 
       // revision 校验
-      if (
-        m.baseRevision !== null &&
-        m.baseRevision !== currentHead.revision
-      ) {
+      if (m.baseRevision !== currentHead.revision) {
         conflicts.push({
           assetType: m.assetType,
           assetId: m.assetId,
@@ -175,8 +174,8 @@ export async function handlePrepare(
         continue;
       }
     } else if (currentHead) {
-      // baseRevision 和 baseContentHash 都为空但资产存在 → revision 冲突
-      // 客户端以为新建，但远端已存在
+      // baseRevision 为 null 但资产已存在 → 冲突
+      // 客户端以为新建，但远端已存在（可能来自之前 CAS_FAILED 的部分写入）
       conflicts.push({
         assetType: m.assetType,
         assetId: m.assetId,
@@ -380,8 +379,8 @@ export async function handleCommit(
     );
     console.log(`[commit] space=${spaceId} asset=${m.assetType}/${m.assetId} baseRev=${m.baseRevision} baseHash=${(m.baseContentHash||'null').slice(0,12)} currentAsset=${currentAsset ? 'rev='+currentAsset.revision+' hash='+(currentAsset.contentHash||'null').slice(0,12) : 'NONE'}`);
 
-    // CAS 校验（与 prepare 对称：同时检查 baseRevision 和 baseContentHash）
-    if (m.baseRevision !== null || m.baseContentHash !== null) {
+    // CAS 校验（与 prepare 对称：baseRevision === null 即新建资产，不触发 CAS）
+    if (m.baseRevision !== null) {
       if (!currentAsset) {
         // 客户端以为资产存在，但远端不存在
         conflicts.push({
@@ -397,10 +396,7 @@ export async function handleCommit(
       }
 
       // revision 校验
-      if (
-        m.baseRevision !== null &&
-        m.baseRevision !== currentAsset.revision
-      ) {
+      if (m.baseRevision !== currentAsset.revision) {
         conflicts.push({
           assetType: m.assetType,
           assetId: m.assetId,
@@ -430,7 +426,7 @@ export async function handleCommit(
         continue;
       }
     } else if (currentAsset) {
-      // baseRevision 和 baseContentHash 都为空但资产已存在 → 冲突
+      // baseRevision 为 null 但资产已存在 → 冲突
       // 客户端以为新建，但远端已存在（可能来自之前 CAS_FAILED 的部分写入）
       conflicts.push({
         assetType: m.assetType,

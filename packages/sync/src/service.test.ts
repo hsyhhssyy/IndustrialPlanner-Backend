@@ -669,5 +669,52 @@ describe("handleCommit", () => {
       expect(result.status).toBe("conflict");
       expect(result.conflicts?.[0]?.reason).toBe("hash-mismatch");
     });
+
+    it("新建资产 baseRevision=null + baseContentHash 非空 + 无现有资产 → 通过 CAS（不因 hash 误判）", async () => {
+      const repo = mockRepo({
+        getSpaceHead: vi.fn().mockResolvedValue(mockSpace({ head: 0 })),
+        getAssetHead: vi.fn().mockResolvedValue(null), // 无现有资产
+        commitBatch: vi.fn().mockResolvedValue([
+          {
+            clientMutationId: "cm-1",
+            assetType: "blueprint",
+            assetId: "bp-001",
+            revision: 1,
+            contentHash: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+          },
+        ]),
+      });
+
+      const token = await makeToken([
+        { clientMutationId: "cm-1", assetType: "blueprint", assetId: "bp-001", baseRevision: null },
+      ]);
+
+      const result = await handleCommit(
+        "test-space",
+        "epoch-1",
+        token,
+        [
+          {
+            clientMutationId: "cm-1",
+            assetType: "blueprint",
+            assetId: "bp-001",
+            baseRevision: null,
+            baseContentHash: "sha256:abc", // 前端附带的额外 hash，不应影响 CAS
+            metadata: "{}",
+            blobHash: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+            blobByteSize: 100,
+            storageMode: "full",
+            schemaVersion: 1,
+            encoding: "identity",
+            writerAppVersion: "1.0.0",
+            writerBuildId: "build-1",
+          },
+        ],
+        commitDeps({ repo }),
+      );
+
+      expect(result.status).toBe("committed");
+      expect(result.head).toBe(1);
+    });
   });
 });
