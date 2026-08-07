@@ -145,6 +145,11 @@ export function createApp() {
       );
     }
 
+    // 无变更且客户端有已知 head → 204 No Content
+    if (!result.changed && knownHead !== null) {
+      return wrapWithCors(new Response(null, { status: 204 }));
+    }
+
     return wrapWithCors(c.json(result, 200));
   });
 
@@ -193,6 +198,15 @@ export function createApp() {
     const repo = createRepository(c.env.DB);
     const localDevHost = c.env.LOCAL_DEV_HOST ?? "";
 
+    const maxMutationsPerBatch = parseInt(
+      c.env.MAX_MUTATIONS_PER_BATCH ?? String(DEFAULT_MAX_MUTATIONS_PER_BATCH),
+      10,
+    );
+    const maxMetadataSize = parseInt(
+      c.env.MAX_METADATA_SIZE ?? String(DEFAULT_MAX_METADATA_SIZE),
+      10,
+    );
+
     const result = await handlePlan(spaceId, assetTypes, {
       repo,
       presignedUrlConfig: {
@@ -202,6 +216,14 @@ export function createApp() {
         bucketName: c.env.R2_BUCKET_NAME ?? "industrial-sync-blobs",
       },
       localDevHost: localDevHost || undefined,
+      capabilities: {
+        protocol: c.env.PROTOCOL_VERSION ?? "cf-sync-v1",
+        maxMutationsPerBatch,
+        maxMetadataSize,
+        supportedStorageModes: ["full"],
+        supportedEncodings: ["identity"],
+        schemaVersions: [1],
+      },
     });
 
     if (!result) {
@@ -312,7 +334,7 @@ export function createApp() {
         const localDevHost = c.env.LOCAL_DEV_HOST ?? "";
         const result = await handlePrepare(
           c.req.param("spaceId"),
-          (body.spaceEpoch as string) ?? "",
+          (body.spaceEpoch as string) ?? (body.epoch as string) ?? "",
           (body.clientBatchId as string) ?? "",
           mutations as PrepareMutation[],
           {
@@ -359,7 +381,7 @@ export function createApp() {
         const repo = createRepository(c.env.DB);
         const result = await handleCommit(
           c.req.param("spaceId"),
-          (body.spaceEpoch as string) ?? "",
+          (body.spaceEpoch as string) ?? (body.epoch as string) ?? "",
           commitToken,
           mutations as PrepareMutation[],
           {

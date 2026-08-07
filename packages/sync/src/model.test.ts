@@ -18,6 +18,11 @@ import {
   type MutationUpload,
   type AlreadyAppliedMutation,
   type ConflictItem,
+  type CheckResponse,
+  type PlanResponse,
+  type PlanModule,
+  type PlanCapabilities,
+  type ModuleHead,
 } from "./model";
 
 describe("model constants", () => {

@@ -235,11 +235,36 @@ export interface AssetSummary {
   deletedAt?: string | null;
 }
 
+// plan 响应中的 capabilities（嵌入）
+export interface PlanCapabilities {
+  protocol: string;
+  maxMutationsPerBatch: number;
+  maxMetadataSize: number;
+  supportedStorageModes: string[];
+  supportedEncodings: string[];
+  schemaVersions: number[];
+}
+
+// plan 响应中的模块分组
+export interface PlanModule {
+  moduleType: string;
+  assets: AssetSummary[];
+}
+
 // plan 响应体
 export interface PlanResponse {
   head: number;
   epoch: string;
-  assets: AssetSummary[];
+  /** 快照 head，与 head 相同；客户端用此字段判断是否需要重新 plan */
+  snapshotHead: number;
+  /** 按 moduleType 分组的资产列表 */
+  modules: PlanModule[];
+  /** 嵌入的能力声明 */
+  capabilities: PlanCapabilities;
+  /** 分页 token，Phase 1 固定为 null */
+  nextPageToken: string | null;
+  /** 服务端保留的最早 head */
+  minRetainedHead: number;
   serverTime: string;
 }
 
@@ -247,12 +272,23 @@ export interface PlanResponse {
 // check 端点类型
 // ============================================================================
 
+// 模块级 head
+export interface ModuleHead {
+  moduleType: string;
+  head: number;
+}
+
 // check 响应体
 export interface CheckResponse {
   head: number;
   epoch: string;
   changed: boolean;
-  updates?: AssetSummary[];
+  /** 当 epoch 变更或变更集较大时，客户端应回退到 plan */
+  planRequired: boolean;
+  /** 自 knownHead 以来变更的资产摘要；changed=false 时为空 */
+  changes: AssetSummary[];
+  /** 各模块当前 head（Phase 2 完善） */
+  moduleHeads: ModuleHead[];
   serverTime: string;
 }
 

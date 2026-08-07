@@ -19,8 +19,11 @@ import type {
   AlreadyAppliedMutation,
   ConflictItem,
   PlanResponse,
+  PlanCapabilities,
+  PlanModule,
   AssetSummary,
   CheckResponse,
+  ModuleHead,
   ResetResponse,
   DownloadsSignResponse,
 } from "./model";
@@ -481,6 +484,8 @@ export interface HandlePlanDeps {
   repo: SyncRepository;
   presignedUrlConfig: PresignedUrlConfig;
   localDevHost?: string;
+  /** 嵌入 plan 响应的能力声明 */
+  capabilities: PlanCapabilities;
 }
 
 export async function handlePlan(
@@ -493,7 +498,8 @@ export async function handlePlan(
 
   const rows = await deps.repo.listAssetHeads(spaceId, space.activeEpoch, assetTypes.length > 0 ? assetTypes : undefined);
 
-  const assets: AssetSummary[] = [];
+  // 按 assetType 分组为 modules
+  const moduleMap = new Map<string, AssetSummary[]>();
   for (const row of rows) {
     let downloadUrl: string | undefined;
     if (row.blobHash) {
@@ -514,7 +520,7 @@ export async function handlePlan(
       }
     }
 
-    assets.push({
+    const asset: AssetSummary = {
       assetType: row.assetType,
       assetId: row.assetId,
       revision: row.revision,
@@ -526,13 +532,28 @@ export async function handlePlan(
       encoding: row.encoding,
       downloadUrl,
       deletedAt: row.deletedAt,
-    });
+    };
+
+    const list = moduleMap.get(row.assetType);
+    if (list) {
+      list.push(asset);
+    } else {
+      moduleMap.set(row.assetType, [asset]);
+    }
   }
+
+  const modules: PlanModule[] = Array.from(moduleMap.entries()).map(
+    ([moduleType, assets]) => ({ moduleType, assets }),
+  );
 
   return {
     head: space.head,
     epoch: space.activeEpoch,
-    assets,
+    snapshotHead: space.head,
+    modules,
+    capabilities: deps.capabilities,
+    nextPageToken: null,
+    minRetainedHead: space.minRetainedHead,
     serverTime: new Date().toISOString(),
   };
 }
@@ -555,10 +576,36 @@ export async function handleCheck(
 
   const changed = knownHead === null || knownHead < space.head;
 
+  let changes: AssetSummary[] = [];
+  const moduleHeads: ModuleHead[] = [];
+
+  if (changed && knownHead !== null) {
+    // 查询 since knownHead 以来变更的资产
+    const rows = await deps.repo.listChangedAssetHeads(spaceId, space.activeEpoch, knownHead);
+    changes = rows.map((row) => ({
+      assetType: row.assetType,
+      assetId: row.assetId,
+      revision: row.revision,
+      contentHash: row.contentHash,
+      schemaVersion: row.schemaVersion,
+      storageMode: row.storageMode,
+      blobHash: row.blobHash,
+      byteSize: row.byteSize,
+      encoding: row.encoding,
+      deletedAt: row.deletedAt,
+    }));
+  }
+
+  // Phase 1: 有变更即要求 plan（后续根据变更量/epoch 变化细化）
+  const planRequired = changed;
+
   return {
     head: space.head,
     epoch: space.activeEpoch,
     changed,
+    planRequired,
+    changes,
+    moduleHeads,
     serverTime: new Date().toISOString(),
   };
 }

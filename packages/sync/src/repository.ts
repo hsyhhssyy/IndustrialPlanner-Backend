@@ -116,6 +116,13 @@ export interface SyncRepository {
     assetTypes?: string[],
   ): Promise<AssetHeadWithBlob[]>;
 
+  /** 查询 current_head > sinceHead 的资产（check 用） */
+  listChangedAssetHeads(
+    spaceId: string,
+    epoch: string,
+    sinceHead: number,
+  ): Promise<AssetHeadWithBlob[]>;
+
   // Idempotency
   getMutationResult(
     spaceId: string,
@@ -345,6 +352,50 @@ export function createRepository(db: D1Database): SyncRepository {
       const result = await db
         .prepare(sql)
         .bind(...params)
+        .all<Record<string, unknown>>();
+
+      if (!result.results) return [];
+
+      return result.results.map((row) => ({
+        assetType: row.asset_type as string,
+        assetId: row.asset_id as string,
+        revision: row.revision as number,
+        contentHash: row.content_hash as string | null,
+        schemaVersion: row.schema_version as number,
+        storageMode: row.storage_mode as string | null,
+        deletedAt: row.deleted_at as string | null,
+        blobHash: row.blob_hash as string,
+        byteSize: row.byte_size as number,
+        encoding: row.encoding as string,
+      }));
+    },
+
+    async listChangedAssetHeads(
+      spaceId: string,
+      epoch: string,
+      sinceHead: number,
+    ): Promise<AssetHeadWithBlob[]> {
+      const sql = `
+        SELECT
+          a.asset_type, a.asset_id, a.revision, a.content_hash,
+          a.schema_version, a.storage_mode, a.deleted_at,
+          COALESCE(v.blob_hash, '') AS blob_hash,
+          COALESCE(v.byte_size, 0) AS byte_size,
+          COALESCE(v.encoding, 'identity') AS encoding
+        FROM sync_assets a
+        LEFT JOIN sync_asset_versions v
+          ON v.space_id = a.space_id
+          AND v.epoch = a.epoch
+          AND v.asset_type = a.asset_type
+          AND v.asset_id = a.asset_id
+          AND v.revision = a.revision
+        WHERE a.space_id = ?1 AND a.epoch = ?2 AND a.current_head > ?3
+        ORDER BY a.asset_type, a.asset_id
+      `;
+
+      const result = await db
+        .prepare(sql)
+        .bind(spaceId, epoch, sinceHead)
         .all<Record<string, unknown>>();
 
       if (!result.results) return [];

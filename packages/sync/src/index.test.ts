@@ -245,7 +245,7 @@ describe("E2E — plan 端点（GET /v1/sync/spaces/:spaceId/plan）", () => {
     }], { repo, commitTokenSecret: MOCK_SECRET, r2Bucket: r2, now: N, presentTime: P });
   });
 
-  it("GET plan → 200，返回 space head + asset 列表", async () => {
+  it("GET plan → 200，返回 space head + 按模块分组的 asset 列表", async () => {
     const w = await import("./index");
     const res = await w.default.fetch(
       new Request(`https://localhost/v1/sync/spaces/${S}/plan`),
@@ -255,11 +255,20 @@ describe("E2E — plan 端点（GET /v1/sync/spaces/:spaceId/plan）", () => {
 
     const body = await res.json() as PlanResponse;
     expect(body.head).toBe(1);
+    expect(body.snapshotHead).toBe(1);
     expect(body.epoch).toBe(E);
-    expect(body.assets).toBeDefined();
-    expect(body.assets.length).toBeGreaterThanOrEqual(1);
+    expect(body.modules).toBeDefined();
+    expect(body.modules.length).toBeGreaterThanOrEqual(1);
 
-    const bp1 = body.assets.find((a: AssetSummary) => a.assetId === "bp-1");
+    // 验证 capabilities 嵌入
+    expect(body.capabilities).toBeDefined();
+    expect(body.capabilities.protocol).toBe("cf-sync-v1");
+    expect(body.nextPageToken).toBeNull();
+    expect(body.minRetainedHead).toBe(0);
+
+    const bpModule = body.modules.find((m) => m.moduleType === "bp");
+    expect(bpModule).toBeDefined();
+    const bp1 = bpModule!.assets.find((a) => a.assetId === "bp-1");
     expect(bp1).toBeDefined();
     expect(bp1!.assetType).toBe("bp");
     expect(bp1!.revision).toBe(1);
@@ -271,7 +280,7 @@ describe("E2E — plan 端点（GET /v1/sync/spaces/:spaceId/plan）", () => {
     expect(bp1!.downloadUrl).toContain("sha256");
   });
 
-  it("GET plan with assetTypes filter → 只返回匹配类型", async () => {
+  it("GET plan with assetTypes filter → 只返回匹配类型的 modules", async () => {
     const w = await import("./index");
     const res = await w.default.fetch(
       new Request(`https://localhost/v1/sync/spaces/${S}/plan?assetTypes=bp`),
@@ -280,11 +289,11 @@ describe("E2E — plan 端点（GET /v1/sync/spaces/:spaceId/plan）", () => {
     expect(res.status).toBe(200);
 
     const body = await res.json() as PlanResponse;
-    expect(body.assets.length).toBeGreaterThanOrEqual(1);
-    expect(body.assets.every((a: AssetSummary) => a.assetType === "bp")).toBe(true);
+    expect(body.modules.length).toBeGreaterThanOrEqual(1);
+    expect(body.modules.every((m) => m.moduleType === "bp")).toBe(true);
   });
 
-  it("GET plan with non-matching assetTypes → 返回空列表", async () => {
+  it("GET plan with non-matching assetTypes → 返回空 modules", async () => {
     const w = await import("./index");
     const res = await w.default.fetch(
       new Request(`https://localhost/v1/sync/spaces/${S}/plan?assetTypes=base`),
@@ -293,7 +302,7 @@ describe("E2E — plan 端点（GET /v1/sync/spaces/:spaceId/plan）", () => {
     expect(res.status).toBe(200);
 
     const body = await res.json() as PlanResponse;
-    expect(body.assets).toHaveLength(0);
+    expect(body.modules).toHaveLength(0);
   });
 
   it("GET plan for non-existent space → 404", async () => {
@@ -343,22 +352,19 @@ describe("E2E — check 端点（GET /v1/sync/spaces/:spaceId/check）", () => {
     }], { repo, commitTokenSecret: MOCK_SECRET, r2Bucket: r2, now: N, presentTime: P });
   });
 
-  it("GET check with knownHead=1 → changed=false", async () => {
+  it("GET check with knownHead=1 → changed=false，204 No Content", async () => {
     const w = await import("./index");
     const res = await w.default.fetch(
       new Request(`https://localhost/v1/sync/spaces/${S}/check?knownHead=1`),
       env(),
     );
-    expect(res.status).toBe(200);
-
-    const body = await res.json() as CheckResponse;
-    expect(body.head).toBe(1);
-    expect(body.epoch).toBe(E);
-    expect(body.changed).toBe(false);
-    expect(body.serverTime).toBeDefined();
+    expect(res.status).toBe(204);
+    // 204 无响应体
+    const text = await res.text();
+    expect(text).toBe("");
   });
 
-  it("GET check with knownHead=0 → changed=true", async () => {
+  it("GET check with knownHead=0 → changed=true，200 + changes/planRequired", async () => {
     const w = await import("./index");
     const res = await w.default.fetch(
       new Request(`https://localhost/v1/sync/spaces/${S}/check?knownHead=0`),
@@ -368,23 +374,27 @@ describe("E2E — check 端点（GET /v1/sync/spaces/:spaceId/check）", () => {
 
     const body = await res.json() as CheckResponse;
     expect(body.changed).toBe(true);
-    // 客户端应回退到 plan
-    expect(body.updates).toBeUndefined();
+    expect(body.planRequired).toBe(true);
+    expect(body.changes).toBeDefined();
+    expect(body.changes.length).toBeGreaterThanOrEqual(1);
+    // 变更资产应包含 chk-1
+    const chk1 = body.changes.find((a) => a.assetId === "chk-1");
+    expect(chk1).toBeDefined();
+    expect(chk1!.assetType).toBe("bp");
+    // moduleHeads Phase 1 为空
+    expect(body.moduleHeads).toEqual([]);
   });
 
-  it("GET check with knownHead > current head → changed=false", async () => {
+  it("GET check with knownHead > current head → changed=false，204", async () => {
     const w = await import("./index");
     const res = await w.default.fetch(
       new Request(`https://localhost/v1/sync/spaces/${S}/check?knownHead=999`),
       env(),
     );
-    expect(res.status).toBe(200);
-
-    const body = await res.json() as CheckResponse;
-    expect(body.changed).toBe(false);
+    expect(res.status).toBe(204);
   });
 
-  it("GET check without knownHead → changed=true", async () => {
+  it("GET check without knownHead → changed=true，200", async () => {
     const w = await import("./index");
     const res = await w.default.fetch(
       new Request(`https://localhost/v1/sync/spaces/${S}/check`),
@@ -394,6 +404,7 @@ describe("E2E — check 端点（GET /v1/sync/spaces/:spaceId/check）", () => {
 
     const body = await res.json() as CheckResponse;
     expect(body.changed).toBe(true);
+    expect(body.planRequired).toBe(true);
   });
 
   it("GET check for non-existent space → 404", async () => {
