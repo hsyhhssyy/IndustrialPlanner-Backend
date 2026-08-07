@@ -1,7 +1,8 @@
-# sync-worker 容器 .dev.vars
+# sync-worker 容器 .dev.vars (2026-08-07 v2: dotenv format)
 # wrangler dev 读取此文件注入环境变量（dotenv 格式：key=value）
-# 注意：.dev.vars 优先级高于 OS 环境变量
-# LOCAL_DEV_HOST 不在此设置，由 K8s env 或 docker run -e 注入
+# 注意：wrangler dev 不透传未声明的 OS 环境变量，必须在此明确声明
+# Beta 环境直传 URL base（与 beta ingress 域名一致）
+LOCAL_DEV_HOST=https://endfield-api.hsyhhssyy.net
 
 COMMIT_TOKEN_SECRET=dev-secret-key-32-bytes-long!!
 R2_ACCESS_KEY_ID=dev

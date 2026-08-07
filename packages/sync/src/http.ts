@@ -59,19 +59,6 @@ export function createApp() {
     );
   });
 
-  // DEBUG: 返回 worker 看到的 LOCAL_DEV_HOST 值
-  app.get("/debug/env", (c) => {
-    const localDevHost = c.env.LOCAL_DEV_HOST ?? "";
-    return wrapWithCors(
-      c.json({
-        LOCAL_DEV_HOST_raw: c.env.LOCAL_DEV_HOST,
-        LOCAL_DEV_HOST_coerced: localDevHost,
-        LOCAL_DEV_HOST_passed: localDevHost || undefined,
-        truthy: !!localDevHost,
-      }),
-    );
-  });
-
   // 能力声明
   app.get("/v1/sync/capabilities", (c) => {
     return wrapWithCors(
