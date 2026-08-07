@@ -545,6 +545,7 @@ export function createRepository(db: D1Database): SyncRepository {
       blobR2Keys: string[],
       committedAt: string,
     ): Promise<AppliedVersionResult[]> {
+      console.log(`[commitBatch] space=${spaceId} newHead=${newHead} versions=${versions.map(v => `${v.assetType}/${v.assetId}@r${v.revision}`).join(',')}`);
       const statements: D1PreparedStatement[] = [];
 
       // 1. INSERT sync_asset_versions

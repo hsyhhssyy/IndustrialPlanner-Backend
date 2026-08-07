@@ -123,6 +123,7 @@ export async function handlePrepare(
       m.assetType,
       m.assetId,
     );
+    console.log(`[prepare] space=${spaceId} asset=${m.assetType}/${m.assetId} baseRev=${m.baseRevision} baseHash=${(m.baseContentHash||'null').slice(0,12)} currentHead=${currentHead ? 'rev='+currentHead.revision : 'NONE'}`);
 
     // 3c. CAS 校验
     if (m.baseRevision !== null || m.baseContentHash !== null) {
@@ -377,6 +378,7 @@ export async function handleCommit(
       m.assetType,
       m.assetId,
     );
+    console.log(`[commit] space=${spaceId} asset=${m.assetType}/${m.assetId} baseRev=${m.baseRevision} baseHash=${(m.baseContentHash||'null').slice(0,12)} currentAsset=${currentAsset ? 'rev='+currentAsset.revision+' hash='+(currentAsset.contentHash||'null').slice(0,12) : 'NONE'}`);
 
     // CAS 校验（与 prepare 对称：同时检查 baseRevision 和 baseContentHash）
     if (m.baseRevision !== null || m.baseContentHash !== null) {
