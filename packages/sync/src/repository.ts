@@ -92,6 +92,25 @@ export interface AssetHeadWithBlob {
   encoding: string;
 }
 
+// sync_module_heads 行类型
+export interface ModuleHeadRow {
+  spaceId: string;
+  moduleType: string;
+  head: number;
+  updatedAt: string;
+}
+
+// sync_changes 行类型
+export interface ChangeRow {
+  spaceId: string;
+  head: number;
+  assetType: string;
+  assetId: string;
+  revision: number;
+  kind: string;
+  createdAt: string;
+}
+
 // ============================================================================
 // Repository 接口
 // ============================================================================
@@ -141,6 +160,12 @@ export interface SyncRepository {
     blobR2Keys: string[],
     committedAt: string,
   ): Promise<AppliedVersionResult[]>;
+
+  // Module Heads
+  getModuleHeads(spaceId: string): Promise<ModuleHeadRow[]>;
+
+  // Changes
+  listChanges(spaceId: string, sinceHead: number): Promise<ChangeRow[]>;
 
   // Health
   checkDbHealth(): Promise<{ ok: boolean }>;
@@ -202,12 +227,7 @@ export function createRepository(db: D1Database): SyncRepository {
       await db
         .prepare(
           `INSERT INTO sync_spaces (space_id, active_epoch, head, min_retained_head, updated_at)
-           VALUES (?1, ?2, ?3, ?4, ?5)
-           ON CONFLICT(space_id) DO UPDATE SET
-             active_epoch = excluded.active_epoch,
-             head = excluded.head,
-             min_retained_head = excluded.min_retained_head,
-             updated_at = excluded.updated_at`,
+           VALUES (?1, ?2, ?3, ?4, ?5)`,
         )
         .bind(
           space.spaceId,
@@ -457,6 +477,52 @@ export function createRepository(db: D1Database): SyncRepository {
         .run();
     },
 
+    // Module Heads
+    async getModuleHeads(spaceId: string): Promise<ModuleHeadRow[]> {
+      const result = await db
+        .prepare(
+          `SELECT space_id, module_type, head, updated_at
+           FROM sync_module_heads WHERE space_id = ?1`,
+        )
+        .bind(spaceId)
+        .all<Record<string, unknown>>();
+
+      if (!result.results) return [];
+      return result.results.map((row) => ({
+        spaceId: row.space_id as string,
+        moduleType: row.module_type as string,
+        head: row.head as number,
+        updatedAt: row.updated_at as string,
+      }));
+    },
+
+    // Changes
+    async listChanges(
+      spaceId: string,
+      sinceHead: number,
+    ): Promise<ChangeRow[]> {
+      const result = await db
+        .prepare(
+          `SELECT space_id, head, asset_type, asset_id, revision, kind, created_at
+           FROM sync_changes
+           WHERE space_id = ?1 AND head > ?2
+           ORDER BY head, asset_type, asset_id`,
+        )
+        .bind(spaceId, sinceHead)
+        .all<Record<string, unknown>>();
+
+      if (!result.results) return [];
+      return result.results.map((row) => ({
+        spaceId: row.space_id as string,
+        head: row.head as number,
+        assetType: row.asset_type as string,
+        assetId: row.asset_id as string,
+        revision: row.revision as number,
+        kind: row.kind as string,
+        createdAt: row.created_at as string,
+      }));
+    },
+
     // Health
     async checkDbHealth(): Promise<{ ok: boolean }> {
       try {
@@ -589,6 +655,37 @@ export function createRepository(db: D1Database): SyncRepository {
         );
       }
 
+      // 4.5 UPSERT sync_module_heads（按 assetType 去重）
+      const seenModuleTypes = new Set<string>();
+      for (const v of versions) {
+        if (seenModuleTypes.has(v.assetType)) continue;
+        seenModuleTypes.add(v.assetType);
+        statements.push(
+          db
+            .prepare(
+              `INSERT INTO sync_module_heads (space_id, module_type, head, updated_at)
+               VALUES (?1, ?2, ?3, ?4)
+               ON CONFLICT(space_id, module_type) DO UPDATE SET
+                 head = excluded.head,
+                 updated_at = excluded.updated_at`,
+            )
+            .bind(spaceId, v.assetType, newHead, committedAt),
+        );
+      }
+
+      // 4.6 INSERT sync_changes
+      for (const v of versions) {
+        statements.push(
+          db
+            .prepare(
+              `INSERT INTO sync_changes
+                 (space_id, head, asset_type, asset_id, revision, kind, created_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, 'upsert', ?6)`,
+            )
+            .bind(spaceId, newHead, v.assetType, v.assetId, v.revision, committedAt),
+        );
+      }
+
       // 5. INSERT sync_mutation_results
       for (const v of versions) {
         statements.push(
@@ -613,7 +710,15 @@ export function createRepository(db: D1Database): SyncRepository {
         );
       }
 
-      await db.batch(statements);
+      const results = await db.batch(statements);
+
+      // CAS 校验：D1 batch() 不是事务，并发时 UPDATE sync_spaces 的
+      // WHERE head = oldHead 可能静默失败（changes=0）。
+      // 此时 sync_assets 已写入但 sync_spaces.head 未推进，导致资产对 check 不可见。
+      const casResult = results[2 * versions.length]; // Step 3: UPDATE sync_spaces
+      if (casResult?.meta?.changes === 0) {
+        throw new Error('CAS_FAILED: sync_spaces head 并发冲突，当前批次资产已部分写入，需客户端重试');
+      }
 
       // 返回 applied 结果
       return versions.map((v) => ({

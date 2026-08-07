@@ -21,18 +21,26 @@ const MOCK_SECRET = "test-secret-key-32-bytes-long!!";
 let db: D1Database;
 let r2: R2Bucket;
 
+function getR2(): R2Bucket {
+  return r2;
+}
+
 beforeAll(async () => {
   const proxy = await getPlatformProxy<{ DB: D1Database; BLOB_STORE: R2Bucket }>({
     configPath: path.resolve(__dirname, "..", "wrangler.toml"),
   });
   db = proxy.env.DB;
   r2 = proxy.env.BLOB_STORE;
-  const sqlPath = path.resolve(__dirname, "..", "migrations", "0001_create_sync_tables.sql");
-  execMigrationSync(db, fs.readFileSync(sqlPath, "utf-8"));
+  const sqlPath1 = path.resolve(__dirname, "..", "migrations", "0001_create_sync_tables.sql");
+  execMigrationSync(db, fs.readFileSync(sqlPath1, "utf-8"));
+  const sqlPath2 = path.resolve(__dirname, "..", "migrations", "0002_add_download_tables.sql");
+  execMigrationSync(db, fs.readFileSync(sqlPath2, "utf-8"));
 });
 
 afterAll(async () => {
   await db.prepare("DELETE FROM sync_mutation_results").run();
+  await db.prepare("DELETE FROM sync_changes").run();
+  await db.prepare("DELETE FROM sync_module_heads").run();
   await db.prepare("DELETE FROM sync_asset_versions").run();
   await db.prepare("DELETE FROM sync_blobs").run();
   await db.prepare("DELETE FROM sync_assets").run();
@@ -381,8 +389,9 @@ describe("E2E — check 端点（GET /v1/sync/spaces/:spaceId/check）", () => {
     const chk1 = body.changes.find((a) => a.assetId === "chk-1");
     expect(chk1).toBeDefined();
     expect(chk1!.assetType).toBe("bp");
-    // moduleHeads Phase 1 为空
-    expect(body.moduleHeads).toEqual([]);
+    // moduleHeads 来自 sync_module_heads（commitBatch 已写入）
+    expect(body.moduleHeads.length).toBeGreaterThanOrEqual(1);
+    expect(body.moduleHeads.some((mh) => mh.moduleType === "bp")).toBe(true);
   });
 
   it("GET check with knownHead > current head → changed=false，204", async () => {
@@ -414,6 +423,115 @@ describe("E2E — check 端点（GET /v1/sync/spaces/:spaceId/check）", () => {
       env(),
     );
     expect(res.status).toBe(404);
+  });
+});
+
+// ============================================================================
+// 跨浏览器可见性 — b1 commit 后 b2 plan/check 可见
+// ============================================================================
+describe("E2E — 跨浏览器可见性（b1 commit → b2 plan/check）", () => {
+  const S = "cross-space", E = "epoch-1", N = Date.now(), P = "2026-08-07T00:00:00Z";
+  const env = () => ({
+    DB: db, BLOB_STORE: r2,
+    PROTOCOL_VERSION: "cf-sync-v1", MAX_MUTATIONS_PER_BATCH: "32", MAX_METADATA_SIZE: "262144",
+    COMMIT_TOKEN_SECRET: MOCK_SECRET,
+    R2_ACCESS_KEY_ID: "", R2_SECRET_ACCESS_KEY: "", R2_ACCOUNT_ID: "", R2_BUCKET_NAME: "",
+    LOCAL_DEV_HOST: "http://localhost:8792",
+  });
+
+  beforeAll(async () => {
+    await createRepository(db).insertSpace({
+      spaceId: S, activeEpoch: E, head: 0, minRetainedHead: 0, updatedAt: P,
+    } satisfies SpaceRow);
+  });
+
+  it("b1 commit → b2 check 看到 changed=true → b2 plan 拿到资产", async () => {
+    // b1: 上传资产
+    const repo = createRepository(db);
+    const h = "cafebabecafebabecafebabecafebabecafebabecafebabecafebabecafebabe";
+    await getR2().put(`sync/v1/${S}/${E}/blobs/sha256/ca/${h}`, "cross-browser-data");
+
+    const token = await signCommitToken({
+      spaceId: S, epoch: E, clientBatchId: "cross-b1", observedHead: 0,
+      mutations: [{ clientMutationId: "cross-cm1", assetType: "bp", assetId: "cross-1", baseRevision: null }],
+      expiresAt: N + 300_000,
+    }, MOCK_SECRET);
+
+    const r = await handleCommit(S, E, token, [{
+      clientMutationId: "cross-cm1", assetType: "bp", assetId: "cross-1",
+      baseRevision: null, baseContentHash: null, metadata: "{}",
+      blobHash: h, blobByteSize: 4, storageMode: "full",
+      schemaVersion: 1, encoding: "identity", writerAppVersion: "1.0.0", writerBuildId: "b1",
+    }], { repo, commitTokenSecret: MOCK_SECRET, r2Bucket: r2, now: N, presentTime: P });
+
+    expect(r.status).toBe("committed");
+    expect(r.head).toBe(1);
+
+    // b2: check — 应该看到 changed
+    const w = await import("./index");
+    const checkRes = await w.default.fetch(
+      new Request(`https://localhost/v1/sync/spaces/${S}/check?knownHead=0`),
+      env(),
+    );
+    expect(checkRes.status).toBe(200);
+    const checkBody = await checkRes.json() as CheckResponse;
+    expect(checkBody.head).toBe(1);
+    expect(checkBody.changed).toBe(true);
+    expect(checkBody.planRequired).toBe(true);
+    expect(checkBody.changes.some((a) => a.assetId === "cross-1")).toBe(true);
+    expect(checkBody.moduleHeads.some((mh) => mh.moduleType === "bp")).toBe(true);
+
+    // b2: plan — 应该拿到资产
+    const planRes = await w.default.fetch(
+      new Request(`https://localhost/v1/sync/spaces/${S}/plan`),
+      env(),
+    );
+    expect(planRes.status).toBe(200);
+    const planBody = await planRes.json() as PlanResponse;
+    expect(planBody.head).toBe(1);
+    expect(planBody.modules.length).toBeGreaterThanOrEqual(1);
+    const bpModule = planBody.modules.find((m) => m.moduleType === "bp");
+    expect(bpModule).toBeDefined();
+    expect(bpModule!.assets.some((a) => a.assetId === "cross-1")).toBe(true);
+  });
+
+  it("b1 commit 后 b2 check with knownHead=0 → changed=true, b2 check with knownHead=1 → 204", async () => {
+    const repo = createRepository(db);
+    const hash2 = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+    await getR2().put(`sync/v1/${S}/${E}/blobs/sha256/de/${hash2}`, "cross-data-2");
+
+    const token = await signCommitToken({
+      spaceId: S, epoch: E, clientBatchId: "cross-b2", observedHead: 1,
+      mutations: [{ clientMutationId: "cross-cm2", assetType: "bp", assetId: "cross-2", baseRevision: null }],
+      expiresAt: N + 300_000,
+    }, MOCK_SECRET);
+
+    const r = await handleCommit(S, E, token, [{
+      clientMutationId: "cross-cm2", assetType: "bp", assetId: "cross-2",
+      baseRevision: null, baseContentHash: null, metadata: "{}",
+      blobHash: hash2, blobByteSize: 4, storageMode: "full",
+      schemaVersion: 1, encoding: "identity", writerAppVersion: "1.0.0", writerBuildId: "b1",
+    }], { repo, commitTokenSecret: MOCK_SECRET, r2Bucket: getR2(), now: N, presentTime: P });
+
+    expect(r.status).toBe("committed");
+    expect(r.head).toBe(2);
+
+    const w = await import("./index");
+
+    // knownHead=0 → changed
+    const r1 = await w.default.fetch(
+      new Request(`https://localhost/v1/sync/spaces/${S}/check?knownHead=0`),
+      env(),
+    );
+    expect(r1.status).toBe(200);
+    expect(((await r1.json()) as CheckResponse).changed).toBe(true);
+
+    // knownHead=2 → 204
+    const r2 = await w.default.fetch(
+      new Request(`https://localhost/v1/sync/spaces/${S}/check?knownHead=2`),
+      env(),
+    );
+    expect(r2.status).toBe(204);
   });
 });
 

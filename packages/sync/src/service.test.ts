@@ -26,11 +26,16 @@ function mockRepo(overrides?: Partial<SyncRepository>): SyncRepository {
   return {
     insertSpace: vi.fn(),
     getSpaceHead: vi.fn().mockResolvedValue(mockSpace()),
+    resetSpace: vi.fn().mockResolvedValue(null),
     upsertAssetHead: vi.fn(),
     getAssetHead: vi.fn().mockResolvedValue(null),
+    listAssetHeads: vi.fn().mockResolvedValue([]),
+    listChangedAssetHeads: vi.fn().mockResolvedValue([]),
     getMutationResult: vi.fn().mockResolvedValue(null),
     insertMutationResult: vi.fn(),
     commitBatch: vi.fn().mockResolvedValue([]),
+    getModuleHeads: vi.fn().mockResolvedValue([]),
+    listChanges: vi.fn().mockResolvedValue([]),
     checkDbHealth: vi.fn().mockResolvedValue({ ok: true }),
     ...overrides,
   };

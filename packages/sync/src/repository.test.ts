@@ -45,15 +45,23 @@ beforeAll(async () => {
   });
   db = proxy.env.DB;
 
-  // 执行 migration
-  const sqlPath = path.resolve(
+  // 执行 migration 0001
+  const sqlPath1 = path.resolve(
     __dirname,
     "..",
     "migrations",
     "0001_create_sync_tables.sql",
   );
-  const sql = fs.readFileSync(sqlPath, "utf-8");
-  await execMigration(db, sql);
+  await execMigration(db, fs.readFileSync(sqlPath1, "utf-8"));
+
+  // 执行 migration 0002
+  const sqlPath2 = path.resolve(
+    __dirname,
+    "..",
+    "migrations",
+    "0002_add_download_tables.sql",
+  );
+  await execMigration(db, fs.readFileSync(sqlPath2, "utf-8"));
 
   repo = createRepository(db);
 });
@@ -61,6 +69,8 @@ beforeAll(async () => {
 afterAll(async () => {
   // 清理测试数据
   await prepare(db, "DELETE FROM sync_mutation_results").run();
+  await prepare(db, "DELETE FROM sync_changes").run();
+  await prepare(db, "DELETE FROM sync_module_heads").run();
   await prepare(db, "DELETE FROM sync_asset_versions").run();
   await prepare(db, "DELETE FROM sync_blobs").run();
   await prepare(db, "DELETE FROM sync_assets").run();
@@ -194,6 +204,92 @@ describe("repository — D1 操作", () => {
         "nonexistent",
       );
       expect(result).toBeNull();
+    });
+  });
+
+  describe("getModuleHeads / listChanges — 新表", () => {
+    it("新 space 无 module head 记录 → 返回空数组", async () => {
+      const heads = await repo.getModuleHeads("test-space");
+      expect(heads).toEqual([]);
+    });
+
+    it("新 space 无 changes → 返回空数组", async () => {
+      const changes = await repo.listChanges("test-space", 0);
+      expect(changes).toEqual([]);
+    });
+
+    it("commitBatch 写入 module_heads + changes", async () => {
+      const h = "sha256:f1f2f3f4f5f6f7f8f9f0a1a2a3a4a5a6a7a8a9a0b1b2b3b4b5b6b7b8b9c0";
+      await prepare(db,
+        `INSERT OR IGNORE INTO sync_blobs (space_id, epoch, blob_hash, r2_key, byte_size, encoding, created_at, last_referenced_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8)`,
+        "test-space", "epoch-1", h, `sync/v1/test-space/epoch-1/blobs/sha256/f1/${h}`, 100, "identity", "2026-08-07T00:00:00Z", "2026-08-07T00:00:00Z",
+      ).run();
+
+      await prepare(db,
+        `UPDATE sync_spaces SET head = 0 WHERE space_id = 'test-space'`,
+      ).run();
+
+      await repo.commitBatch(
+        "test-space", "epoch-1", 1,
+        [{
+          clientMutationId: "cm-heads", assetType: "bp", assetId: "bp-h1",
+          kind: "full", baseContentHash: null, targetContentHash: h,
+          blobHash: h, byteSize: 100, encoding: "identity",
+          revision: 1, schemaVersion: 1, minReadableSchemaVersion: 1,
+          writerAppVersion: "1.0.0", writerBuildId: "b1",
+          storageMode: "full", baseFullBlobHash: h, deltaDepth: 0,
+          contentHash: h,
+        }],
+        [h],
+        [`sync/v1/test-space/epoch-1/blobs/sha256/f1/${h}`],
+        "2026-08-07T00:00:00Z",
+      );
+
+      // 验证 module_heads
+      const heads = await repo.getModuleHeads("test-space");
+      expect(heads.length).toBe(1);
+      expect(heads[0]!.moduleType).toBe("bp");
+      expect(heads[0]!.head).toBe(1);
+
+      // 验证 changes
+      const changes = await repo.listChanges("test-space", 0);
+      expect(changes.length).toBe(1);
+      expect(changes[0]!.head).toBe(1);
+      expect(changes[0]!.assetType).toBe("bp");
+      expect(changes[0]!.assetId).toBe("bp-h1");
+      expect(changes[0]!.revision).toBe(1);
+      expect(changes[0]!.kind).toBe("upsert");
+    });
+
+    it("同一 module_type 多次 commit → module_heads 覆盖为最新 head", async () => {
+      const h = "sha256:aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
+      await prepare(db,
+        "INSERT OR IGNORE INTO sync_blobs (space_id, epoch, blob_hash, r2_key, byte_size, encoding, created_at, last_referenced_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+        "test-space", "epoch-1", h, `sync/v1/test-space/epoch-1/blobs/sha256/aa/${h}`, 100, "identity", "2026-08-07T00:00:00Z", "2026-08-07T00:00:00Z",
+      ).run();
+
+      await prepare(db, "UPDATE sync_spaces SET head = 1 WHERE space_id = 'test-space'").run();
+
+      await repo.commitBatch(
+        "test-space", "epoch-1", 2,
+        [{
+          clientMutationId: "cm-heads2", assetType: "bp", assetId: "bp-h2",
+          kind: "full", baseContentHash: null, targetContentHash: h,
+          blobHash: h, byteSize: 100, encoding: "identity",
+          revision: 1, schemaVersion: 1, minReadableSchemaVersion: 1,
+          writerAppVersion: "1.0.0", writerBuildId: "b1",
+          storageMode: "full", baseFullBlobHash: h, deltaDepth: 0,
+          contentHash: h,
+        }],
+        [h],
+        [`sync/v1/test-space/epoch-1/blobs/sha256/aa/${h}`],
+        "2026-08-07T00:00:00Z",
+      );
+
+      const heads = await repo.getModuleHeads("test-space");
+      const bpHead = heads.find((h) => h.moduleType === "bp");
+      expect(bpHead?.head).toBe(2);
     });
   });
 

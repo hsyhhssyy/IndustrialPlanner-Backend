@@ -92,7 +92,7 @@ export interface AlreadyAppliedMutation {
 export interface ConflictItem {
   assetType: string;
   assetId: string;
-  reason: "revision-mismatch" | "hash-mismatch" | "space-epoch-changed";
+  reason: "revision-mismatch" | "hash-mismatch" | "space-epoch-changed" | "token-expired" | "token-invalid" | "concurrent-commit-conflict";
   expectedRevision: number | null;
   actualRevision: number;
   expectedHash: string | null;

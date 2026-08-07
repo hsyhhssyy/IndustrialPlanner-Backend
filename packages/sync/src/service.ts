@@ -3,7 +3,7 @@
 // 职责：协调 repository、commit_token、presigned_url 完成业务逻辑。
 // 不直接访问 D1/R2，通过注入的依赖接口操作。
 
-import type { SyncRepository, AssetHeadRow, CommitVersionInput } from "./repository";
+import type { SyncRepository, AssetHeadRow, CommitVersionInput, AppliedVersionResult } from "./repository";
 import type { PresignedUrlConfig } from "./presigned_url";
 import { generatePresignedUploadUrl, generatePresignedDownloadUrl } from "./presigned_url";
 import {
@@ -283,7 +283,7 @@ export async function handleCommit(
         {
           assetType: "",
           assetId: "",
-          reason: "space-epoch-changed",
+          reason: tokenResult.code === "token_expired" ? "token-expired" : "token-invalid",
           expectedRevision: null,
           actualRevision: 0,
           expectedHash: null,
@@ -456,17 +456,40 @@ export async function handleCommit(
     return { status: "conflict", conflicts };
   }
 
-  // 7. D1 batch 原子提交
+  // 7. D1 batch 原子提交（含 CAS 校验）
   const newHead = space.head + 1;
-  const applied = await deps.repo.commitBatch(
-    spaceId,
-    requestEpoch,
-    newHead,
-    versions,
-    blobHashes,
-    blobR2Keys,
-    deps.presentTime,
-  );
+  let applied: AppliedVersionResult[];
+  try {
+    applied = await deps.repo.commitBatch(
+      spaceId,
+      requestEpoch,
+      newHead,
+      versions,
+      blobHashes,
+      blobR2Keys,
+      deps.presentTime,
+    );
+  } catch (e) {
+    if (e instanceof Error && e.message.startsWith('CAS_FAILED:')) {
+      // D1 batch 非事务导致 CAS 静默失败，已写入的 sync_assets 留在 DB 中但不影响正确性
+      // （客户端重试时会重新走 prepare → commit 流程，CAS 会重新校验）
+      return {
+        status: "conflict",
+        conflicts: [
+          {
+            assetType: "",
+            assetId: "",
+            reason: "concurrent-commit-conflict",
+            expectedRevision: null,
+            actualRevision: 0,
+            expectedHash: null,
+            actualHash: null,
+          },
+        ],
+      };
+    }
+    throw e;
+  }
 
   return {
     status: "committed",
@@ -594,6 +617,12 @@ export async function handleCheck(
       encoding: row.encoding,
       deletedAt: row.deletedAt,
     }));
+  }
+
+  // 读取模块级 head（来自 sync_module_heads）
+  const mhRows = await deps.repo.getModuleHeads(spaceId);
+  for (const mh of mhRows) {
+    moduleHeads.push({ moduleType: mh.moduleType, head: mh.head });
   }
 
   // Phase 1: 有变更即要求 plan（后续根据变更量/epoch 变化细化）

@@ -106,6 +106,16 @@ export function createApp() {
     const now = new Date().toISOString();
 
     const repo = createRepository(c.env.DB);
+
+    // 防止覆盖已有空间：重复创建会变更 activeEpoch + 重置 head 为 0，
+    // 导致旧 epoch 下已提交的资产在 plan 中不可见
+    const existing = await repo.getSpaceHead(spaceId.trim());
+    if (existing) {
+      return wrapWithCors(
+        c.json({ error: "conflict", message: "空间已存在" }, 409),
+      );
+    }
+
     await repo.insertSpace({
       spaceId: spaceId.trim(),
       activeEpoch,
