@@ -224,6 +224,8 @@ export async function handlePrepare(
       assetType: m.assetType,
       assetId: m.assetId,
       baseRevision: m.baseRevision,
+      blobHash: m.blobHash,
+      blobByteSize: m.blobByteSize,
     });
   }
 
@@ -361,6 +363,18 @@ export async function handleCommit(
     };
   }
 
+  // 3a. 构建 tokenMutation 索引：按 clientMutationId 查 token 中的 blobHash/blobByteSize
+  const tokenMutMap = new Map<string, TokenMutation>();
+  for (const tm of tokenPayload.mutations) {
+    tokenMutMap.set(tm.clientMutationId, tm);
+  }
+
+  // 3b. 用 token 中的 blobHash/blobByteSize 补充客户端可能缺失的字段
+  const resolvedMutations = normalizedMutations.map((m) => {
+    const tm = tokenMutMap.get(m.clientMutationId);
+    return tm ? { ...m, blobHash: tm.blobHash || m.blobHash, blobByteSize: tm.blobByteSize || m.blobByteSize } : m;
+  });
+
   // 4. 读取当前 space head
   const space = await deps.repo.getSpaceHead(spaceId);
   if (!space) {
@@ -386,7 +400,7 @@ export async function handleCommit(
   const blobHashes: string[] = [];
   const blobR2Keys: string[] = [];
 
-  for (const m of normalizedMutations) {
+  for (const m of resolvedMutations) {
     const currentAsset = await deps.repo.getAssetHead(
       spaceId,
       requestEpoch,

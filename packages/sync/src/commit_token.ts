@@ -8,6 +8,10 @@ export interface TokenMutation {
   assetType: string;
   assetId: string;
   baseRevision: number | null;
+  /** blobHash，用于 commit 阶段不需要客户端重复提交 */
+  blobHash: string;
+  /** blobByteSize，用于 commit 阶段不需要客户端重复提交 */
+  blobByteSize: number;
 }
 
 export interface CommitTokenPayload {

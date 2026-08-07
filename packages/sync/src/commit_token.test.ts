@@ -21,12 +21,16 @@ describe("commit_token — 签发与验证", () => {
         assetType: "blueprint",
         assetId: "bp-001",
         baseRevision: null,
+        blobHash: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+        blobByteSize: 100,
       },
       {
         clientMutationId: "cm-2",
         assetType: "config",
         assetId: "cfg-001",
         baseRevision: 3,
+        blobHash: "c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8a9b0",
+        blobByteSize: 200,
       },
     ],
     expiresAt: Date.now() + 300_000, // 5 分钟
