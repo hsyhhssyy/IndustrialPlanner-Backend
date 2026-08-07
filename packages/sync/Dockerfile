@@ -11,13 +11,15 @@ RUN npm install -g pnpm
 
 COPY pnpm-workspace.yaml pnpm-lock.yaml package.json tsconfig.base.json ./
 COPY packages/shared/package.json packages/shared/tsconfig.json ./packages/shared/
-COPY packages/sync/package.json packages/sync/tsconfig.json packages/sync/wrangler.toml ./packages/sync/
+COPY packages/sync/package.json packages/sync/tsconfig.json ./packages/sync/
 
 RUN pnpm install --frozen-lockfile
 
+# 在 install 之后复制源码和配置（避免缓存旧 wrangler.toml）
 COPY packages/shared/src ./packages/shared/src
 COPY packages/sync/src ./packages/sync/src
 COPY packages/sync/migrations ./packages/sync/migrations
+COPY packages/sync/wrangler.toml ./packages/sync/
 
 # ---- runtime stage ----
 FROM node:22-slim
