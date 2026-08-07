@@ -46,6 +46,6 @@ EXPOSE 8080
 
 CMD ["bash", "-c", "\
   cd packages/sync && \
-  wrangler d1 migrations apply sync-db --local --persist-to /data && \
-  exec wrangler dev --ip 0.0.0.0 --port 8080 --persist-to /data \
+  npx wrangler d1 migrations apply sync-db --local --persist-to /data && \
+  exec npx wrangler dev --ip 0.0.0.0 --port 8080 --persist-to /data \
   "]
