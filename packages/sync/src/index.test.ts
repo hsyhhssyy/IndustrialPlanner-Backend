@@ -101,6 +101,41 @@ describe("E2E — worker.fetch 集成（真实 D1）", () => {
     expect(head).not.toBeNull();
     expect(head!.size).toBe(blobBody.length);
   });
+
+  it("GET blob 下载 → 返回 blob 内容", async () => {
+    const w = await import("./index");
+    const blobBody = "download-test-content";
+    const hash = "b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3"; // 64 字符
+    const key = `sync/v1/test-space/epoch-1/blobs/sha256/b2/${hash}`;
+
+    // 先 PUT blob
+    await r2.put(key, blobBody, {
+      httpMetadata: { contentType: "application/json" },
+    });
+
+    // GET 下载
+    const url = `/v1/sync/spaces/test-space/blobs/epoch-1/sha256/b2/${hash}`;
+    const getRes = await w.default.fetch(
+      new Request(`https://localhost${url}`),
+      env(),
+    );
+    expect(getRes.status).toBe(200);
+    expect(getRes.headers.get("Content-Type")).toBe("application/json");
+
+    const body = await getRes.text();
+    expect(body).toBe(blobBody);
+  });
+
+  it("GET blob 下载 — 不存在的 blob → 404", async () => {
+    const w = await import("./index");
+    const hash = "c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4";
+    const url = `/v1/sync/spaces/test-space/blobs/epoch-1/sha256/c3/${hash}`;
+    const getRes = await w.default.fetch(
+      new Request(`https://localhost${url}`),
+      env(),
+    );
+    expect(getRes.status).toBe(404);
+  });
 });
 
 // 全流程 E2E（真实 D1 + R2）

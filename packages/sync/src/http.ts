@@ -191,6 +191,38 @@ export function createApp() {
     }
   });
 
+  // ==================================================================
+  // 本地 blob 下载 — GET 从 R2 读取
+  // ==================================================================
+  app.get("/v1/sync/spaces/:spaceId/blobs/:epoch/sha256/:prefix/:blobHash", async (c) => {
+    const { spaceId, epoch, prefix, blobHash } = c.req.param();
+    if (!spaceId || !epoch || !prefix || !blobHash) {
+      return wrapWithCors(c.json({ error: "bad_request", message: "缺少路径参数" }, 400));
+    }
+
+    if (prefix.length !== 2 || blobHash.length !== 64) {
+      return wrapWithCors(c.json({ error: "bad_request", message: "非法 blobHash" }, 400));
+    }
+
+    const key = `sync/v1/${spaceId}/${epoch}/blobs/sha256/${prefix}/${blobHash}`;
+    try {
+      const obj = await c.env.BLOB_STORE.get(key);
+      if (!obj) {
+        return wrapWithCors(c.json({ error: "not_found", message: "blob 不存在" }, 404));
+      }
+      const headers = new Headers();
+      headers.set("Content-Type", obj.httpMetadata?.contentType ?? "application/octet-stream");
+      if (obj.httpMetadata?.cacheControl) {
+        headers.set("Cache-Control", obj.httpMetadata.cacheControl);
+      }
+      return wrapWithCors(new Response(obj.body, { headers, status: 200 }));
+    } catch (e) {
+      return wrapWithCors(
+        c.json({ error: "internal_error", message: `R2 读取失败: ${(e as Error).message}` }, 500),
+      );
+    }
+  });
+
   // plan — 启动/大检查入口，返回空间 head + 全量资产摘要
   app.get("/v1/sync/spaces/:spaceId/plan", async (c) => {
     if (!c.env.DB) {
