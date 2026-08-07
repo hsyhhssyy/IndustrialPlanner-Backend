@@ -314,9 +314,25 @@ export async function handleCommit(
     };
   }
 
+  // 2a. 规范化 mutations：JSON 中缺失的字段在 JS 中是 undefined，
+  //     但 CAS 比较需要 null 语义（undefined !== null → 新资产被误判为旧资产）
+  const normalizedMutations = mutations.map((m) => ({
+    ...m,
+    baseRevision: m.baseRevision ?? null,
+    baseContentHash: m.baseContentHash ?? null,
+    blobHash: m.blobHash ?? "",
+    blobByteSize: m.blobByteSize ?? 0,
+    metadata: m.metadata ?? "{}",
+    storageMode: m.storageMode ?? "full",
+    schemaVersion: m.schemaVersion ?? 1,
+    encoding: m.encoding ?? "identity",
+    writerAppVersion: m.writerAppVersion ?? "0.0.0",
+    writerBuildId: m.writerBuildId ?? "unknown",
+  }));
+
   // 3. 幂等检查（全部 mutation 已提交 → already-committed）
   const mutationResults: Map<string, MutationResultRow> = new Map();
-  for (const m of mutations) {
+  for (const m of normalizedMutations) {
     const existing = await deps.repo.getMutationResult(
       spaceId,
       requestEpoch,
@@ -326,11 +342,11 @@ export async function handleCommit(
       mutationResults.set(m.clientMutationId, existing);
     }
   }
-  if (mutationResults.size === mutations.length && mutations.length > 0) {
+  if (mutationResults.size === normalizedMutations.length && normalizedMutations.length > 0) {
     const space = await deps.repo.getSpaceHead(spaceId);
     return {
       status: "already-committed",
-      applied: mutations.map((m) => {
+      applied: normalizedMutations.map((m) => {
         const mr = mutationResults.get(m.clientMutationId)!;
         return {
           clientMutationId: m.clientMutationId,
@@ -370,7 +386,7 @@ export async function handleCommit(
   const blobHashes: string[] = [];
   const blobR2Keys: string[] = [];
 
-  for (const m of mutations) {
+  for (const m of normalizedMutations) {
     const currentAsset = await deps.repo.getAssetHead(
       spaceId,
       requestEpoch,
@@ -440,25 +456,28 @@ export async function handleCommit(
       continue;
     }
 
-    // CAS 校验通过后：校验 blob 在 R2 中存在
-    const blobPrefix = m.blobHash.substring(0, 2);
-    const blobR2Key = `sync/v1/${spaceId}/${requestEpoch}/blobs/sha256/${blobPrefix}/${m.blobHash}`;
-    try {
-      const obj = await deps.r2Bucket.head(blobR2Key);
-      if (!obj) {
-        conflicts.push({
-          assetType: m.assetType,
-          assetId: m.assetId,
-          reason: "blob-missing",
-          expectedRevision: m.baseRevision,
-          actualRevision: currentAsset?.revision ?? 0,
-          expectedHash: m.baseContentHash,
-          actualHash: m.blobHash,
-        });
-        continue;
+    // CAS 校验通过后：校验 blob 在 R2 中存在（blobHash 为空则跳过）
+    let blobR2Key = "";
+    if (m.blobHash && m.blobHash.length >= 2) {
+      const blobPrefix = m.blobHash.substring(0, 2);
+      blobR2Key = `sync/v1/${spaceId}/${requestEpoch}/blobs/sha256/${blobPrefix}/${m.blobHash}`;
+      try {
+        const obj = await deps.r2Bucket.head(blobR2Key);
+        if (!obj) {
+          conflicts.push({
+            assetType: m.assetType,
+            assetId: m.assetId,
+            reason: "blob-missing",
+            expectedRevision: m.baseRevision,
+            actualRevision: currentAsset?.revision ?? 0,
+            expectedHash: m.baseContentHash,
+            actualHash: m.blobHash,
+          });
+          continue;
+        }
+      } catch {
+        // R2 不可用时跳过校验（本地环境可容忍）
       }
-    } catch {
-      // R2 不可用时跳过校验（本地环境可容忍）
     }
 
     // 构造 version 输入
