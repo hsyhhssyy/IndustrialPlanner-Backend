@@ -1,15 +1,10 @@
-# sync-worker 本地开发容器
+# sync-worker 容器 .dev.vars
+# wrangler dev 读取此文件注入环境变量（dotenv 格式：key=value）
+# 注意：.dev.vars 优先级高于 OS 环境变量
+# LOCAL_DEV_HOST 不在此设置，由 K8s env 或 docker run -e 注入
 
-# 默认值，可通过 --build-arg 或环境变量覆盖
-ARG LOCAL_DEV_HOST=http://localhost:8080
-ENV LOCAL_DEV_HOST=$LOCAL_DEV_HOST
-
-# 开发凭据（容器内本地使用，不连 Cloudflare）
-ENV COMMIT_TOKEN_SECRET=dev-secret-key-32-bytes-long!!
-ENV R2_ACCESS_KEY_ID=dev
-ENV R2_SECRET_ACCESS_KEY=dev
-ENV R2_ACCOUNT_ID=dev
-ENV R2_BUCKET_NAME=dev
-
-# wrangler dev 端口
-ENV PORT=8080
+COMMIT_TOKEN_SECRET=dev-secret-key-32-bytes-long!!
+R2_ACCESS_KEY_ID=dev
+R2_SECRET_ACCESS_KEY=dev
+R2_ACCOUNT_ID=dev
+R2_BUCKET_NAME=dev
