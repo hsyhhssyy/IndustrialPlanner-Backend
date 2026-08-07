@@ -3,7 +3,7 @@
 // 职责：协调 repository、commit_token、presigned_url 完成业务逻辑。
 // 不直接访问 D1/R2，通过注入的依赖接口操作。
 
-import type { SyncRepository, AssetHeadRow, CommitVersionInput, AppliedVersionResult } from "./repository";
+import type { SyncRepository, AssetHeadRow, CommitVersionInput, AppliedVersionResult, MutationResultRow } from "./repository";
 import type { PresignedUrlConfig } from "./presigned_url";
 import { generatePresignedUploadUrl, generatePresignedDownloadUrl } from "./presigned_url";
 import {
@@ -313,8 +313,34 @@ export async function handleCommit(
     };
   }
 
-  // 3. 幂等检查（全部 mutation 已提交 → already-committed）
-  const allAlreadyApplied: typeof mutations = [];
+  // 3. 请求体 mutations 必须与 token 内 mutations 一致（防篡改）
+  {
+    const tokenMutationMap = new Map(
+      tokenPayload.mutations.map((tm) => [tm.clientMutationId, tm]),
+    );
+    for (const m of mutations) {
+      const tm = tokenMutationMap.get(m.clientMutationId);
+      if (!tm || tm.assetType !== m.assetType || tm.assetId !== m.assetId || tm.baseRevision !== m.baseRevision) {
+        return {
+          status: "conflict",
+          conflicts: [
+            {
+              assetType: m.assetType,
+              assetId: m.assetId,
+              reason: "token-invalid",
+              expectedRevision: tm?.baseRevision ?? null,
+              actualRevision: 0,
+              expectedHash: null,
+              actualHash: null,
+            },
+          ],
+        };
+      }
+    }
+  }
+
+  // 4. 幂等检查（全部 mutation 已提交 → already-committed）
+  const mutationResults: Map<string, MutationResultRow> = new Map();
   for (const m of mutations) {
     const existing = await deps.repo.getMutationResult(
       spaceId,
@@ -322,26 +348,29 @@ export async function handleCommit(
       m.clientMutationId,
     );
     if (existing) {
-      allAlreadyApplied.push(m);
+      mutationResults.set(m.clientMutationId, existing);
     }
   }
-  if (allAlreadyApplied.length === mutations.length && mutations.length > 0) {
+  if (mutationResults.size === mutations.length && mutations.length > 0) {
     const space = await deps.repo.getSpaceHead(spaceId);
     return {
       status: "already-committed",
-      applied: allAlreadyApplied.map((m) => ({
-        clientMutationId: m.clientMutationId,
-        assetType: m.assetType,
-        assetId: m.assetId,
-        revision: 1, // 从幂等结果中补充，此处简化
-        contentHash: m.blobHash,
-      })),
+      applied: mutations.map((m) => {
+        const mr = mutationResults.get(m.clientMutationId)!;
+        return {
+          clientMutationId: m.clientMutationId,
+          assetType: m.assetType,
+          assetId: m.assetId,
+          revision: mr.appliedRevision,
+          contentHash: mr.contentHash ?? m.blobHash,
+        };
+      }),
       head: space?.head ?? 0,
       serverTime: deps.presentTime,
     };
   }
 
-  // 4. 读取当前 space head
+  // 5. 读取当前 space head
   const space = await deps.repo.getSpaceHead(spaceId);
   if (!space) {
     return {
@@ -360,7 +389,7 @@ export async function handleCommit(
     };
   }
 
-  // 5. 对每个 mutation 重新校验 revision CAS
+  // 6. 对每个 mutation 重新校验 revision CAS
   const conflicts: ConflictItem[] = [];
   const versions: CommitVersionInput[] = [];
   const blobHashes: string[] = [];
@@ -374,22 +403,58 @@ export async function handleCommit(
       m.assetId,
     );
 
-    // CAS 校验
-    if (m.baseRevision !== null) {
-      if (!currentAsset || currentAsset.revision !== m.baseRevision) {
+    // CAS 校验（与 prepare 对称：同时检查 baseRevision 和 baseContentHash）
+    if (m.baseRevision !== null || m.baseContentHash !== null) {
+      if (!currentAsset) {
+        // 客户端以为资产存在，但远端不存在
         conflicts.push({
           assetType: m.assetType,
           assetId: m.assetId,
           reason: "revision-mismatch",
           expectedRevision: m.baseRevision,
-          actualRevision: currentAsset?.revision ?? 0,
+          actualRevision: 0,
           expectedHash: m.baseContentHash,
-          actualHash: currentAsset?.contentHash ?? null,
+          actualHash: null,
+        });
+        continue;
+      }
+
+      // revision 校验
+      if (
+        m.baseRevision !== null &&
+        m.baseRevision !== currentAsset.revision
+      ) {
+        conflicts.push({
+          assetType: m.assetType,
+          assetId: m.assetId,
+          reason: "revision-mismatch",
+          expectedRevision: m.baseRevision,
+          actualRevision: currentAsset.revision,
+          expectedHash: m.baseContentHash,
+          actualHash: currentAsset.contentHash,
+        });
+        continue;
+      }
+
+      // hash 校验
+      if (
+        m.baseContentHash !== null &&
+        m.baseContentHash !== currentAsset.contentHash
+      ) {
+        conflicts.push({
+          assetType: m.assetType,
+          assetId: m.assetId,
+          reason: "hash-mismatch",
+          expectedRevision: m.baseRevision,
+          actualRevision: currentAsset.revision,
+          expectedHash: m.baseContentHash,
+          actualHash: currentAsset.contentHash,
         });
         continue;
       }
     } else if (currentAsset) {
-      // baseRevision 为 null 但资产已存在 → conflict
+      // baseRevision 和 baseContentHash 都为空但资产已存在 → 冲突
+      // 客户端以为新建，但远端已存在（可能来自之前 CAS_FAILED 的部分写入）
       conflicts.push({
         assetType: m.assetType,
         assetId: m.assetId,
@@ -402,7 +467,7 @@ export async function handleCommit(
       continue;
     }
 
-    // CAS 校验通过后：校验 blob 在 R2 中存在（本地或远端）
+    // CAS 校验通过后：校验 blob 在 R2 中存在
     const blobPrefix = m.blobHash.substring(0, 2);
     const blobR2Key = `sync/v1/${spaceId}/${requestEpoch}/blobs/sha256/${blobPrefix}/${m.blobHash}`;
     try {
@@ -411,11 +476,11 @@ export async function handleCommit(
         conflicts.push({
           assetType: m.assetType,
           assetId: m.assetId,
-          reason: "revision-mismatch",
+          reason: "blob-missing",
           expectedRevision: m.baseRevision,
           actualRevision: currentAsset?.revision ?? 0,
           expectedHash: m.baseContentHash,
-          actualHash: null,
+          actualHash: m.blobHash,
         });
         continue;
       }
@@ -451,12 +516,12 @@ export async function handleCommit(
     blobR2Keys.push(blobR2Key);
   }
 
-  // 6. 任意冲突 → 拒绝整批
+  // 7. 任意冲突 → 拒绝整批
   if (conflicts.length > 0) {
     return { status: "conflict", conflicts };
   }
 
-  // 7. D1 batch 原子提交（含 CAS 校验）
+  // 8. D1 batch 提交（含 CAS 校验）
   const newHead = space.head + 1;
   let applied: AppliedVersionResult[];
   try {
@@ -471,8 +536,10 @@ export async function handleCommit(
     );
   } catch (e) {
     if (e instanceof Error && e.message.startsWith('CAS_FAILED:')) {
-      // D1 batch 非事务导致 CAS 静默失败，已写入的 sync_assets 留在 DB 中但不影响正确性
-      // （客户端重试时会重新走 prepare → commit 流程，CAS 会重新校验）
+      // D1 batch() 非事务：sync_assets / sync_asset_versions 已写入但 sync_spaces.head 未推进。
+      // 这会导致资产对 plan/check 不可见（head 不变），但重试 prepare 时
+      // baseRevision=null + currentHead 存在 → revision-mismatch → 客户端重新 plan 获取
+      // 正确 head 后再次提交。
       return {
         status: "conflict",
         conflicts: [

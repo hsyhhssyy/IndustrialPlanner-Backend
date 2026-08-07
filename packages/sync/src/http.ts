@@ -14,6 +14,7 @@ import {
   DEFAULT_MAX_MUTATIONS_PER_BATCH,
   DEFAULT_MAX_METADATA_SIZE,
   type PrepareMutation,
+  type CommitMutationsRequest,
 } from "./model";
 import { handlePrepare, handleCommit, handlePlan, handleCheck, handleReset, handleDownloadsSign } from "./service";
 import { createRepository } from "./repository";
@@ -368,8 +369,8 @@ export function createApp() {
       }
 
       case "commit": {
-        const commitToken = body.commitToken as string | undefined;
-        if (!commitToken) {
+        const commitReq = body as CommitMutationsRequest;
+        if (!commitReq.commitToken) {
           return wrapWithCors(
             c.json(
               { error: "bad_request", message: "缺少 commitToken 字段" },
@@ -378,8 +379,7 @@ export function createApp() {
           );
         }
 
-        const mutations = body.mutations as Array<unknown> | undefined;
-        if (!Array.isArray(mutations)) {
+        if (!Array.isArray(commitReq.mutations)) {
           return wrapWithCors(
             c.json(
               { error: "bad_request", message: "mutations 必须是数组" },
@@ -392,8 +392,8 @@ export function createApp() {
         const result = await handleCommit(
           c.req.param("spaceId"),
           (body.spaceEpoch as string) ?? (body.epoch as string) ?? "",
-          commitToken,
-          mutations as PrepareMutation[],
+          commitReq.commitToken,
+          commitReq.mutations,
           {
             repo,
             commitTokenSecret: c.env.COMMIT_TOKEN_SECRET ?? "dev-secret-key-32-bytes-long!!",

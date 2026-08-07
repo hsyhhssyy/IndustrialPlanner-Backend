@@ -570,5 +570,137 @@ describe("handleCommit", () => {
       expect(result.status).toBe("conflict");
       expect(result.conflicts?.[0]?.reason).toBe("revision-mismatch");
     });
+
+    it("请求体 mutations 与 token 不匹配 → token-invalid", async () => {
+      const token = await makeToken([
+        { clientMutationId: "cm-1", assetType: "blueprint", assetId: "bp-001", baseRevision: null },
+      ]);
+
+      const result = await handleCommit(
+        "test-space",
+        "epoch-1",
+        token,
+        [
+          {
+            clientMutationId: "cm-evil", // 不在 token 中
+            assetType: "blueprint",
+            assetId: "bp-999",
+            baseRevision: null,
+            baseContentHash: null,
+            metadata: "{}",
+            blobHash: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+            blobByteSize: 100,
+            storageMode: "full",
+            schemaVersion: 1,
+            encoding: "identity",
+            writerAppVersion: "1.0.0",
+            writerBuildId: "build-1",
+          },
+        ],
+        commitDeps(),
+      );
+
+      expect(result.status).toBe("conflict");
+      expect(result.conflicts?.[0]?.reason).toBe("token-invalid");
+    });
+
+    it("R2 blob 不存在 → blob-missing", async () => {
+      const repo = mockRepo({
+        getSpaceHead: vi.fn().mockResolvedValue(mockSpace({ head: 0 })),
+        getAssetHead: vi.fn().mockResolvedValue(null), // 新资产
+      });
+      const deps = commitDeps({
+        repo,
+        r2Bucket: {
+          head: vi.fn().mockResolvedValue(null), // blob 不存在
+        } as unknown as R2Bucket,
+      });
+
+      const token = await makeToken([
+        { clientMutationId: "cm-1", assetType: "blueprint", assetId: "bp-001", baseRevision: null },
+      ]);
+
+      const result = await handleCommit(
+        "test-space",
+        "epoch-1",
+        token,
+        [
+          {
+            clientMutationId: "cm-1",
+            assetType: "blueprint",
+            assetId: "bp-001",
+            baseRevision: null,
+            baseContentHash: null,
+            metadata: "{}",
+            blobHash: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+            blobByteSize: 100,
+            storageMode: "full",
+            schemaVersion: 1,
+            encoding: "identity",
+            writerAppVersion: "1.0.0",
+            writerBuildId: "build-1",
+          },
+        ],
+        deps,
+      );
+
+      expect(result.status).toBe("conflict");
+      expect(result.conflicts?.[0]?.reason).toBe("blob-missing");
+    });
+
+    it("已存在资产 baseRevision 匹配但 hash 不匹配 → hash-mismatch", async () => {
+      const repo = mockRepo({
+        getSpaceHead: vi.fn().mockResolvedValue(mockSpace({ head: 1 })),
+        getAssetHead: vi.fn().mockResolvedValue({
+          spaceId: "test-space",
+          epoch: "epoch-1",
+          assetType: "blueprint",
+          assetId: "bp-001",
+          revision: 3,
+          currentHead: 1,
+          contentHash: "actual-hash",
+          deletedAt: null,
+          schemaVersion: 1,
+          minReadableSchemaVersion: 1,
+          writerAppVersion: "1.0.0",
+          writerBuildId: "build-1",
+          committedAt: "2026-08-06T00:00:00Z",
+          storageMode: "full",
+          baseFullBlobHash: null,
+          deltaDepth: 0,
+        } satisfies AssetHeadRow),
+      });
+
+      const token = await makeToken([
+        { clientMutationId: "cm-1", assetType: "blueprint", assetId: "bp-001", baseRevision: 3 },
+      ]);
+
+      const result = await handleCommit(
+        "test-space",
+        "epoch-1",
+        token,
+        [
+          {
+            clientMutationId: "cm-1",
+            assetType: "blueprint",
+            assetId: "bp-001",
+            baseRevision: 3,
+            baseContentHash: "expected-hash", // 与 actual-hash 不匹配
+            metadata: "{}",
+            blobHash: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+            blobByteSize: 100,
+            storageMode: "full",
+            schemaVersion: 1,
+            encoding: "identity",
+            writerAppVersion: "1.0.0",
+            writerBuildId: "build-1",
+          },
+        ],
+        commitDeps({ repo }),
+      );
+
+      expect(result.status).toBe("conflict");
+      expect(result.conflicts?.[0]?.reason).toBe("hash-mismatch");
+    });
   });
 });

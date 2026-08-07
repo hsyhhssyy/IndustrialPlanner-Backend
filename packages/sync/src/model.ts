@@ -92,7 +92,7 @@ export interface AlreadyAppliedMutation {
 export interface ConflictItem {
   assetType: string;
   assetId: string;
-  reason: "revision-mismatch" | "hash-mismatch" | "space-epoch-changed" | "token-expired" | "token-invalid" | "concurrent-commit-conflict";
+  reason: "revision-mismatch" | "hash-mismatch" | "space-epoch-changed" | "token-expired" | "token-invalid" | "concurrent-commit-conflict" | "blob-missing";
   expectedRevision: number | null;
   actualRevision: number;
   expectedHash: string | null;
@@ -113,6 +113,8 @@ export interface CommitMutationsRequest {
   protocol: string;
   action: "commit";
   commitToken: string;
+  /** 必须与 prepare 阶段发送的 mutations 完全一致 */
+  mutations: PrepareMutation[];
 }
 
 // 已应用的资产版本
