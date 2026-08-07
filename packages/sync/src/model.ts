@@ -171,7 +171,7 @@ export function isValidStorageMode(mode: string | null | undefined): boolean {
   return VALID_STORAGE_MODES.has(mode);
 }
 
-// 批次校验（数量 + 无重复 + storageMode 合法）
+// 批次校验（数量 + 必填字段 + 无重复 + storageMode 合法）
 export function validateMutationBatch(
   mutations: PrepareMutation[],
   maxBatchSize: number,
@@ -202,6 +202,49 @@ export function validateMutationBatch(
       };
     }
     seen.add(key);
+  }
+
+  // 必填字段校验
+  const REQUIRED_STRING_FIELDS: { key: keyof PrepareMutation; label: string }[] = [
+    { key: "clientMutationId", label: "clientMutationId" },
+    { key: "assetType", label: "assetType" },
+    { key: "assetId", label: "assetId" },
+    { key: "blobHash", label: "blobHash" },
+    { key: "encoding", label: "encoding" },
+    { key: "writerAppVersion", label: "writerAppVersion" },
+    { key: "writerBuildId", label: "writerBuildId" },
+  ];
+  const REQUIRED_NUMBER_FIELDS: { key: keyof PrepareMutation; label: string }[] = [
+    { key: "blobByteSize", label: "blobByteSize" },
+    { key: "schemaVersion", label: "schemaVersion" },
+  ];
+  for (const m of mutations) {
+    for (const { key, label } of REQUIRED_STRING_FIELDS) {
+      if (typeof m[key] !== "string" || (m[key] as string).length === 0) {
+        return {
+          ok: false,
+          code: "bad_request",
+          message: `mutation 缺少必填字段 ${label}`,
+        };
+      }
+    }
+    for (const { key, label } of REQUIRED_NUMBER_FIELDS) {
+      if (typeof m[key] !== "number" || (m[key] as number) < 0) {
+        return {
+          ok: false,
+          code: "bad_request",
+          message: `mutation 缺少必填字段 ${label}`,
+        };
+      }
+    }
+    // blobHash 必须是 64 字符 hex
+    if (!/^[0-9a-f]{64}$/.test(m.blobHash)) {
+      return {
+        ok: false,
+        code: "bad_request",
+        message: `mutation blobHash 必须是 64 字符 hex: ${m.clientMutationId}`,
+      };
+    }
   }
 
   // storageMode 合法

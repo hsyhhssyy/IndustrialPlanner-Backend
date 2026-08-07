@@ -190,17 +190,18 @@ export async function handlePrepare(
 
     // 3d. 生成上传 URL（本地直传 或 S3 预签名）
     let uploadUrl: string | undefined;
-    if (deps.localDevHost) {
+    const blobHash = m.blobHash ?? "";
+    if (deps.localDevHost && blobHash.length >= 2) {
       // 本地开发：直接提供本地 blob 直传 URL
-      const prefix = m.blobHash.substring(0, 2);
-      uploadUrl = `${deps.localDevHost}/v1/sync/spaces/${encodeURIComponent(spaceId)}/blobs/${encodeURIComponent(currentEpoch)}/sha256/${prefix}/${encodeURIComponent(m.blobHash)}`;
+      const prefix = blobHash.substring(0, 2);
+      uploadUrl = `${deps.localDevHost}/v1/sync/spaces/${encodeURIComponent(spaceId)}/blobs/${encodeURIComponent(currentEpoch)}/sha256/${prefix}/${encodeURIComponent(blobHash)}`;
     } else if (deps.presignedUrlConfig.accessKeyId) {
       try {
         uploadUrl = await generatePresignedUploadUrl(
           deps.presignedUrlConfig,
           spaceId,
           currentEpoch,
-          m.blobHash,
+          blobHash,
           m.blobByteSize,
         );
       } catch {
