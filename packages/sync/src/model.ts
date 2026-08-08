@@ -7,6 +7,35 @@
 export const PROTOCOL_VERSION = "cf-sync-v1";
 export const DEFAULT_MAX_MUTATIONS_PER_BATCH = 32;
 export const DEFAULT_MAX_METADATA_SIZE = 262144; // 256KB
+export const DEFAULT_R2_ENTER_THRESHOLD_BYTES = 600 * 1024;
+export const DEFAULT_D1_RETURN_THRESHOLD_BYTES = Math.floor(
+  DEFAULT_R2_ENTER_THRESHOLD_BYTES * 0.9,
+);
+export const DEFAULT_MAX_BATCH_D1_BLOB_BYTES = 8 * 1024 * 1024;
+export const DEFAULT_MAX_R2_BLOB_BYTES = 25 * 1024 * 1024;
+export const STORAGE_THRESHOLD_VERSION = 1;
+
+export type StorageBackend = "d1" | "r2";
+
+export function selectStorageBackend(
+  currentBackend: StorageBackend,
+  byteSize: number,
+  r2EnterThreshold = DEFAULT_R2_ENTER_THRESHOLD_BYTES,
+  d1ReturnThreshold = DEFAULT_D1_RETURN_THRESHOLD_BYTES,
+): StorageBackend {
+  if (currentBackend === "r2") {
+    return byteSize <= d1ReturnThreshold ? "d1" : "r2";
+  }
+  return byteSize < r2EnterThreshold ? "d1" : "r2";
+}
+
+export function deriveFixedR2Key(
+  spaceId: string,
+  assetType: string,
+  assetId: string,
+): string {
+  return `sync/v2/spaces/${encodeURIComponent(spaceId)}/assets/${encodeURIComponent(assetType)}/${encodeURIComponent(assetId)}/payload`;
+}
 
 // ============================================================================
 // 核心领域类型
@@ -75,6 +104,8 @@ export interface MutationUpload {
   assetType: string;
   assetId: string;
   required: boolean;
+  backend?: StorageBackend;
+  sessionId?: string;
   url?: string;
   headers?: Record<string, string>;
 }
@@ -92,7 +123,7 @@ export interface AlreadyAppliedMutation {
 export interface ConflictItem {
   assetType: string;
   assetId: string;
-  reason: "revision-mismatch" | "hash-mismatch" | "space-epoch-changed" | "token-expired" | "token-invalid" | "concurrent-commit-conflict" | "blob-missing";
+  reason: "revision-mismatch" | "hash-mismatch" | "space-epoch-changed" | "token-expired" | "token-invalid" | "concurrent-commit-conflict" | "blob-missing" | "storage-busy" | "upload-in-progress";
   expectedRevision: number | null;
   actualRevision: number;
   expectedHash: string | null;
@@ -276,6 +307,7 @@ export interface AssetSummary {
   blobHash: string;
   byteSize: number;
   encoding: string;
+  backend?: StorageBackend;
   downloadUrl?: string;
   deletedAt?: string | null;
 }
@@ -288,6 +320,9 @@ export interface PlanCapabilities {
   supportedStorageModes: string[];
   supportedEncodings: string[];
   schemaVersions: number[];
+  r2EnterThresholdBytes?: number;
+  d1ReturnThresholdBytes?: number;
+  maxR2BlobBytes?: number;
 }
 
 // plan 响应中的模块分组
@@ -350,6 +385,27 @@ export interface ResetResponse {
 }
 
 // ============================================================================
+// 资产删除端点类型
+// ============================================================================
+
+export interface DeleteAssetRequest {
+  spaceEpoch: string;
+  expectedRevision: number;
+  expectedContentHash?: string | null;
+}
+
+export interface DeleteAssetResponse {
+  ok: true;
+  deleted: boolean;
+  spaceId: string;
+  assetType: string;
+  assetId: string;
+  revision: number;
+  head: number;
+  deletedAt: string;
+}
+
+// ============================================================================
 // downloads:sign 端点类型
 // ============================================================================
 
@@ -362,6 +418,9 @@ export interface DownloadsSignRequest {
 export interface SignedUrl {
   blobHash: string;
   url: string;
+  assetType?: string;
+  assetId?: string;
+  revision?: number;
 }
 
 // downloads:sign 响应体

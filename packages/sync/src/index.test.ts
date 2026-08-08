@@ -6,14 +6,18 @@ import path from "path";
 import fs from "node:fs";
 import { createRepository } from "./repository";
 import { signCommitToken } from "./commit_token";
-import { handleCommit } from "./service";
+import { handleCommitLegacyForAudit as handleCommit } from "./service";
 import type { SpaceRow } from "./repository";
-import type { PlanResponse, AssetSummary, CheckResponse, ResetResponse, DownloadsSignResponse } from "./model";
+import { deriveFixedR2Key, type PlanResponse, type AssetSummary, type CheckResponse, type ResetResponse, type DownloadsSignResponse } from "./model";
 
-function execMigrationSync(db: D1Database, sql: string) {
+async function execMigrationSync(db: D1Database, sql: string): Promise<void> {
   const cleaned = sql.split("\n").filter((l) => !l.trimStart().startsWith("--")).join("\n");
   for (const stmt of cleaned.split(";").map((s) => s.trim()).filter((s) => s.length > 0)) {
-    db.prepare(stmt).run();
+    try {
+      await db.prepare(stmt).run();
+    } catch (error) {
+      if (!String(error).includes("duplicate column name:")) throw error;
+    }
   }
 }
 
@@ -25,6 +29,43 @@ function getR2(): R2Bucket {
   return r2;
 }
 
+async function seedLatestStorage(
+  spaceId: string,
+  epoch: string,
+  assetType: string,
+  assetId: string,
+  blobHash: string,
+  content = "legacy-test-content",
+): Promise<void> {
+  const bytes = new TextEncoder().encode(content);
+  await db.prepare(
+    `INSERT INTO sync_asset_storage
+       (space_id, asset_type, asset_id, active_epoch, active_backend,
+        storage_state, current_blob_hash, current_byte_size, current_encoding,
+        d1_content, d1_blob_hash, d1_byte_size, d1_encoding,
+        r2_key, r2_present, updated_at)
+     VALUES (?1,?2,?3,?4,'d1','stable',?5,?6,'identity',?7,?5,?6,'identity',?8,0,?9)
+     ON CONFLICT(space_id, asset_type, asset_id) DO UPDATE SET
+       active_epoch = excluded.active_epoch, active_backend = 'd1',
+       storage_state = 'stable', current_blob_hash = excluded.current_blob_hash,
+       current_byte_size = excluded.current_byte_size,
+       current_encoding = excluded.current_encoding,
+       d1_content = excluded.d1_content, d1_blob_hash = excluded.d1_blob_hash,
+       d1_byte_size = excluded.d1_byte_size, d1_encoding = excluded.d1_encoding,
+       updated_at = excluded.updated_at`,
+  ).bind(
+    spaceId,
+    assetType,
+    assetId,
+    epoch,
+    blobHash,
+    bytes.byteLength,
+    bytes,
+    deriveFixedR2Key(spaceId, assetType, assetId),
+    new Date().toISOString(),
+  ).run();
+}
+
 beforeAll(async () => {
   const proxy = await getPlatformProxy<{ DB: D1Database; BLOB_STORE: R2Bucket }>({
     configPath: path.resolve(__dirname, "..", "wrangler.toml"),
@@ -32,12 +73,21 @@ beforeAll(async () => {
   db = proxy.env.DB;
   r2 = proxy.env.BLOB_STORE;
   const sqlPath1 = path.resolve(__dirname, "..", "migrations", "0001_create_sync_tables.sql");
-  execMigrationSync(db, fs.readFileSync(sqlPath1, "utf-8"));
+  await execMigrationSync(db, fs.readFileSync(sqlPath1, "utf-8"));
   const sqlPath2 = path.resolve(__dirname, "..", "migrations", "0002_add_download_tables.sql");
-  execMigrationSync(db, fs.readFileSync(sqlPath2, "utf-8"));
+  await execMigrationSync(db, fs.readFileSync(sqlPath2, "utf-8"));
+  const sqlPath3 = path.resolve(__dirname, "..", "migrations", "0003_tiered_latest_storage.sql");
+  await execMigrationSync(db, fs.readFileSync(sqlPath3, "utf-8"));
+  const sqlPath4 = path.resolve(__dirname, "..", "migrations", "0004_delete_intent_recovery.sql");
+  await execMigrationSync(db, fs.readFileSync(sqlPath4, "utf-8"));
 });
 
 afterAll(async () => {
+  await db.prepare("DELETE FROM sync_delete_intents").run();
+  await db.prepare("DELETE FROM sync_commit_guards").run();
+  await db.prepare("DELETE FROM sync_commit_intents").run();
+  await db.prepare("DELETE FROM sync_upload_sessions").run();
+  await db.prepare("DELETE FROM sync_asset_storage").run();
   await db.prepare("DELETE FROM sync_mutation_results").run();
   await db.prepare("DELETE FROM sync_changes").run();
   await db.prepare("DELETE FROM sync_module_heads").run();
@@ -79,11 +129,12 @@ describe("E2E — worker.fetch 集成（真实 D1）", () => {
     expect(res.headers.get("access-control-allow-origin")).toBe("*");
   });
 
-  it("PUT blob 直传 → 写入本地 R2", async () => {
+  it("PUT blob 裸路径 → 401，不允许绕过 prepare 票据", async () => {
     const w = await import("./index");
     const blobBody = "binary-blob-content";
     const hash = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2"; // 64 字符
     const url = `/v1/sync/spaces/test-space/blobs/epoch-1/sha256/a1/${hash}`;
+    await r2.delete(`sync/v1/test-space/epoch-1/blobs/sha256/a1/${hash}`);
 
     // PUT blob
     const putRes = await w.default.fetch(
@@ -94,15 +145,15 @@ describe("E2E — worker.fetch 集成（真实 D1）", () => {
       }),
       env(),
     );
-    expect(putRes.status).toBe(200);
+    expect(putRes.status).toBe(401);
 
     // HEAD 验证
     const head = await r2.head(`sync/v1/test-space/epoch-1/blobs/sha256/a1/${hash}`);
-    expect(head).not.toBeNull();
-    expect(head!.size).toBe(blobBody.length);
+    expect(head).toBeNull();
+    expect(blobBody.length).toBeGreaterThan(0);
   });
 
-  it("GET blob 下载 → 返回 blob 内容", async () => {
+  it("GET blob 裸路径 → 401，即使底层对象存在也不能读取", async () => {
     const w = await import("./index");
     const blobBody = "download-test-content";
     const hash = "b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3"; // 64 字符
@@ -119,14 +170,15 @@ describe("E2E — worker.fetch 集成（真实 D1）", () => {
       new Request(`https://localhost${url}`),
       env(),
     );
-    expect(getRes.status).toBe(200);
+    expect(getRes.status).toBe(401);
     expect(getRes.headers.get("Content-Type")).toBe("application/json");
 
     const body = await getRes.text();
-    expect(body).toBe(blobBody);
+    expect(body).not.toBe(blobBody);
+    await r2.delete(key);
   });
 
-  it("GET blob 下载 — 不存在的 blob → 404", async () => {
+  it("GET blob 下载 — 缺少票据优先返回 401", async () => {
     const w = await import("./index");
     const hash = "c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4";
     const url = `/v1/sync/spaces/test-space/blobs/epoch-1/sha256/c3/${hash}`;
@@ -134,7 +186,7 @@ describe("E2E — worker.fetch 集成（真实 D1）", () => {
       new Request(`https://localhost${url}`),
       env(),
     );
-    expect(getRes.status).toBe(404);
+    expect(getRes.status).toBe(401);
   });
 });
 
@@ -286,6 +338,7 @@ describe("E2E — plan 端点（GET /v1/sync/spaces/:spaceId/plan）", () => {
       blobHash: h, blobByteSize: 4, storageMode: "full",
       schemaVersion: 1, encoding: "identity", writerAppVersion: "1.0.0", writerBuildId: "b1",
     }], { repo, commitTokenSecret: MOCK_SECRET, r2Bucket: r2, now: N, presentTime: P });
+    await seedLatestStorage(S, E, "bp", "bp-1", h, "plan-asset-data");
   });
 
   it("GET plan → 200，返回 space head + 按模块分组的 asset 列表", async () => {
@@ -393,6 +446,7 @@ describe("E2E — check 端点（GET /v1/sync/spaces/:spaceId/check）", () => {
       blobHash: h, blobByteSize: 4, storageMode: "full",
       schemaVersion: 1, encoding: "identity", writerAppVersion: "1.0.0", writerBuildId: "b1",
     }], { repo, commitTokenSecret: MOCK_SECRET, r2Bucket: r2, now: N, presentTime: P });
+    await seedLatestStorage(S, E, "bp", "chk-1", h, "check-data");
   });
 
   it("GET check with knownHead=1 → changed=false，204 No Content", async () => {
@@ -498,6 +552,7 @@ describe("E2E — 跨浏览器可见性（b1 commit → b2 plan/check）", () =>
       blobHash: h, blobByteSize: 4, storageMode: "full",
       schemaVersion: 1, encoding: "identity", writerAppVersion: "1.0.0", writerBuildId: "b1",
     }], { repo, commitTokenSecret: MOCK_SECRET, r2Bucket: r2, now: N, presentTime: P });
+    await seedLatestStorage(S, E, "bp", "cross-1", h, "cross-browser-data");
 
     expect(r.status).toBe("committed");
     expect(r.head).toBe(1);
@@ -547,6 +602,7 @@ describe("E2E — 跨浏览器可见性（b1 commit → b2 plan/check）", () =>
       blobHash: hash2, blobByteSize: 4, storageMode: "full",
       schemaVersion: 1, encoding: "identity", writerAppVersion: "1.0.0", writerBuildId: "b1",
     }], { repo, commitTokenSecret: MOCK_SECRET, r2Bucket: getR2(), now: N, presentTime: P });
+    await seedLatestStorage(S, E, "bp", "cross-2", hash2, "cross-data-2");
 
     expect(r.status).toBe("committed");
     expect(r.head).toBe(2);
@@ -645,9 +701,10 @@ describe("E2E — downloads:sign 端点（POST /v1/sync/spaces/:spaceId/download
     } satisfies SpaceRow);
   });
 
-  it("POST downloads:sign → 返回本地下载 URL", async () => {
+  // AI-CORRECTION 2026-08-08: 下载签名只能针对当前资产；任意 hash 不再获得可访问 URL。
+  it("POST downloads:sign 对任意非当前 hash → 404", async () => {
     const w = await import("./index");
-    const hash = "d1d2d3d4d5d6d7d8d9d0e1e2e3e4e5e6e7e8e9e0";
+    const hash = "d1d2d3d4d5d6d7d8d9d0e1e2e3e4e5e6e7e8e9e0f1f2f3f4f5f6f7f8f9f0a1a2";
     const res = await w.default.fetch(
       new Request(`https://localhost/v1/sync/spaces/${S}/downloads:sign`, {
         method: "POST",
@@ -656,15 +713,8 @@ describe("E2E — downloads:sign 端点（POST /v1/sync/spaces/:spaceId/download
       }),
       env(),
     );
-    expect(res.status).toBe(200);
-
-    const body = await res.json() as DownloadsSignResponse;
-    expect(body.urls).toBeDefined();
-    expect(body.urls).toHaveLength(1);
-    expect(body.urls[0].blobHash).toBe(hash);
-    // 本地模式：localDevHost URL
-    expect(body.urls[0].url).toContain("/blobs/");
-    expect(body.urls[0].url).toContain("sha256");
+    expect(res.status).toBe(404);
+    expect(await res.json()).toMatchObject({ error: "stale_blob" });
   });
 
   it("POST downloads:sign empty blobHashes → 返回空数组", async () => {

@@ -30,7 +30,11 @@ async function execMigration(database: D1Database, sql: string): Promise<void> {
     .filter((s) => s.length > 0);
 
   for (const stmt of statements) {
-    await database.prepare(stmt).run();
+    try {
+      await database.prepare(stmt).run();
+    } catch (error) {
+      if (!String(error).includes("duplicate column name:")) throw error;
+    }
   }
 }
 
@@ -63,11 +67,32 @@ beforeAll(async () => {
   );
   await execMigration(db, fs.readFileSync(sqlPath2, "utf-8"));
 
+  const sqlPath3 = path.resolve(
+    __dirname,
+    "..",
+    "migrations",
+    "0003_tiered_latest_storage.sql",
+  );
+  await execMigration(db, fs.readFileSync(sqlPath3, "utf-8"));
+
+  const sqlPath4 = path.resolve(
+    __dirname,
+    "..",
+    "migrations",
+    "0004_delete_intent_recovery.sql",
+  );
+  await execMigration(db, fs.readFileSync(sqlPath4, "utf-8"));
+
   repo = createRepository(db);
 });
 
 afterAll(async () => {
   // 清理测试数据
+  await prepare(db, "DELETE FROM sync_delete_intents").run();
+  await prepare(db, "DELETE FROM sync_commit_guards").run();
+  await prepare(db, "DELETE FROM sync_commit_intents").run();
+  await prepare(db, "DELETE FROM sync_upload_sessions").run();
+  await prepare(db, "DELETE FROM sync_asset_storage").run();
   await prepare(db, "DELETE FROM sync_mutation_results").run();
   await prepare(db, "DELETE FROM sync_changes").run();
   await prepare(db, "DELETE FROM sync_module_heads").run();

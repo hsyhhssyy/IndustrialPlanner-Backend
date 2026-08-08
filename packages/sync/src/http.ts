@@ -13,10 +13,28 @@ import {
   validateMutationBatch,
   DEFAULT_MAX_MUTATIONS_PER_BATCH,
   DEFAULT_MAX_METADATA_SIZE,
+  DEFAULT_R2_ENTER_THRESHOLD_BYTES,
+  DEFAULT_D1_RETURN_THRESHOLD_BYTES,
+  DEFAULT_MAX_BATCH_D1_BLOB_BYTES,
+  DEFAULT_MAX_R2_BLOB_BYTES,
   type PrepareMutation,
   type CommitMutationsRequest,
+  type DeleteAssetRequest,
 } from "./model";
-import { handlePrepare, handleCommit, handlePlan, handleCheck, handleReset, handleDownloadsSign } from "./service";
+import {
+  handlePrepare,
+  handleCommit,
+  handlePlan,
+  handleCheck,
+  handleReset,
+  handleDownloadsSign,
+  handlePayloadUpload,
+  handlePayloadDownload,
+  recoverPendingCommit,
+  handleDeleteAsset,
+  StorageProtocolError,
+  type TieredStorageConfig,
+} from "./service";
 import { createRepository } from "./repository";
 
 // Sync Worker 环境绑定类型
@@ -26,6 +44,11 @@ export interface SyncEnv {
   PROTOCOL_VERSION: string;
   MAX_MUTATIONS_PER_BATCH: string;
   MAX_METADATA_SIZE: string;
+  R2_ENTER_THRESHOLD_BYTES?: string;
+  D1_RETURN_THRESHOLD_BYTES?: string;
+  MAX_BATCH_D1_BLOB_BYTES?: string;
+  MAX_R2_BLOB_BYTES?: string;
+  RETENTION_HEAD_WINDOW?: string;
   COMMIT_TOKEN_SECRET: string;
   R2_ACCESS_KEY_ID: string;
   R2_SECRET_ACCESS_KEY: string;
@@ -33,10 +56,65 @@ export interface SyncEnv {
   R2_BUCKET_NAME: string;
   /** 本地开发时直传 URL 的 base host（如 http://localhost:8792），空串表示使用 S3 预签名 */
   LOCAL_DEV_HOST: string;
+  /** 对外能力 URL 的 origin；为空时使用当前请求 origin。 */
+  PUBLIC_BASE_URL?: string;
+}
+
+function positiveInteger(value: string | undefined, fallback: number): number {
+  const parsed = Number.parseInt(value ?? "", 10);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function storageConfig(env: SyncEnv): TieredStorageConfig {
+  return {
+    r2EnterThresholdBytes: positiveInteger(
+      env.R2_ENTER_THRESHOLD_BYTES,
+      DEFAULT_R2_ENTER_THRESHOLD_BYTES,
+    ),
+    d1ReturnThresholdBytes: positiveInteger(
+      env.D1_RETURN_THRESHOLD_BYTES,
+      DEFAULT_D1_RETURN_THRESHOLD_BYTES,
+    ),
+    maxBatchD1BlobBytes: positiveInteger(
+      env.MAX_BATCH_D1_BLOB_BYTES,
+      DEFAULT_MAX_BATCH_D1_BLOB_BYTES,
+    ),
+    maxR2BlobBytes: positiveInteger(
+      env.MAX_R2_BLOB_BYTES,
+      DEFAULT_MAX_R2_BLOB_BYTES,
+    ),
+    retentionHeadWindow: positiveInteger(env.RETENTION_HEAD_WINDOW, 1000),
+  };
+}
+
+function publicBaseUrl(c: Context<{ Bindings: SyncEnv }>): string {
+  return (c.env.PUBLIC_BASE_URL || new URL(c.req.url).origin).replace(/\/$/, "");
+}
+
+function requireCommitTokenSecret(env: SyncEnv): string {
+  const secret = env.COMMIT_TOKEN_SECRET;
+  if (typeof secret !== "string" || secret.length < 24) {
+    throw new StorageProtocolError(
+      503,
+      "configuration_error",
+      "COMMIT_TOKEN_SECRET 未配置或长度不足",
+    );
+  }
+  return secret;
 }
 
 export function createApp() {
   const app = new Hono<{ Bindings: SyncEnv }>();
+
+  app.onError((error, c) => {
+    if (error instanceof StorageProtocolError) {
+      return wrapWithCors(c.json({ error: error.code, message: error.message }, error.status as 400));
+    }
+    console.error("[sync] 未处理异常", error);
+    return wrapWithCors(
+      c.json({ error: "internal_error", message: "同步服务内部错误" }, 500),
+    );
+  });
 
   // CORS 预检 — 所有路径
   app.options("*", (c) => {
@@ -61,6 +139,7 @@ export function createApp() {
 
   // 能力声明
   app.get("/v1/sync/capabilities", (c) => {
+    const tiering = storageConfig(c.env);
     return wrapWithCors(
       c.json({
         protocol: c.env.PROTOCOL_VERSION ?? "cf-sync-v1",
@@ -75,6 +154,9 @@ export function createApp() {
         supportedStorageModes: ["full"],
         supportedEncodings: ["identity"],
         schemaVersions: [1],
+        r2EnterThresholdBytes: tiering.r2EnterThresholdBytes,
+        d1ReturnThresholdBytes: tiering.d1ReturnThresholdBytes,
+        maxR2BlobBytes: tiering.maxR2BlobBytes,
       }),
     );
   });
@@ -148,6 +230,7 @@ export function createApp() {
     }
 
     const repo = createRepository(c.env.DB);
+    await recoverPendingCommit(spaceId, { repo, r2Bucket: c.env.BLOB_STORE });
     const result = await handleCheck(spaceId, knownHead, { repo });
 
     if (!result) {
@@ -166,8 +249,36 @@ export function createApp() {
 
   // ==================================================================
   // 本地 blob 直传 — PUT 写入 R2
+  // AI-CORRECTION 2026-08-08: 当前端点同时承载 D1/R2 票据上传；裸路径不再可写。
   // ==================================================================
   app.put("/v1/sync/spaces/:spaceId/blobs/:epoch/sha256/:prefix/:blobHash", async (c) => {
+    {
+      const path = c.req.param();
+      const ticket = c.req.query("ticket") ?? "";
+      if (!ticket) {
+        throw new StorageProtocolError(401, "token_invalid", "缺少上传票据");
+      }
+      if (!/^[0-9a-f]{64}$/.test(path.blobHash) || path.prefix !== path.blobHash.substring(0, 2)) {
+        throw new StorageProtocolError(400, "bad_request", "非法 blobHash 或 prefix");
+      }
+      const contentLength = Number.parseInt(c.req.header("content-length") ?? "0", 10);
+      const maximum = storageConfig(c.env).maxR2BlobBytes;
+      if (Number.isFinite(contentLength) && contentLength > maximum) {
+        throw new StorageProtocolError(413, "blob_too_large", "payload 超过文件上限");
+      }
+      const bytes = await c.req.arrayBuffer();
+      if (bytes.byteLength > maximum) {
+        throw new StorageProtocolError(413, "blob_too_large", "payload 超过文件上限");
+      }
+      const result = await handlePayloadUpload(path, ticket, bytes, {
+        repo: createRepository(c.env.DB),
+        r2Bucket: c.env.BLOB_STORE,
+        commitTokenSecret: requireCommitTokenSecret(c.env),
+        now: Date.now(),
+      });
+      return wrapWithCors(c.json({ ok: true, ...result }, 200));
+    }
+
     const { spaceId, epoch, prefix, blobHash } = c.req.param();
     if (!spaceId || !epoch || !prefix || !blobHash) {
       return wrapWithCors(c.json({ error: "bad_request", message: "缺少路径参数" }, 400));
@@ -193,8 +304,25 @@ export function createApp() {
 
   // ==================================================================
   // 本地 blob 下载 — GET 从 R2 读取
+  // AI-CORRECTION 2026-08-08: 当前端点先验证版本绑定票据和 active_backend，再读取 D1/R2。
   // ==================================================================
   app.get("/v1/sync/spaces/:spaceId/blobs/:epoch/sha256/:prefix/:blobHash", async (c) => {
+    {
+      const path = c.req.param();
+      const ticket = c.req.query("ticket") ?? "";
+      if (!ticket) {
+        throw new StorageProtocolError(401, "token_invalid", "缺少下载票据");
+      }
+      const repo = createRepository(c.env.DB);
+      await recoverPendingCommit(path.spaceId, { repo, r2Bucket: c.env.BLOB_STORE });
+      const result = await handlePayloadDownload(path, ticket, {
+        repo,
+        r2Bucket: c.env.BLOB_STORE,
+        commitTokenSecret: requireCommitTokenSecret(c.env),
+      });
+      return wrapWithCors(new Response(result.body, { status: 200, headers: result.headers }));
+    }
+
     const { spaceId, epoch, prefix, blobHash } = c.req.param();
     if (!spaceId || !epoch || !prefix || !blobHash) {
       return wrapWithCors(c.json({ error: "bad_request", message: "缺少路径参数" }, 400));
@@ -210,12 +338,14 @@ export function createApp() {
       if (!obj) {
         return wrapWithCors(c.json({ error: "not_found", message: "blob 不存在" }, 404));
       }
+      const legacyObject = obj!;
       const headers = new Headers();
-      headers.set("Content-Type", obj.httpMetadata?.contentType ?? "application/octet-stream");
-      if (obj.httpMetadata?.cacheControl) {
-        headers.set("Cache-Control", obj.httpMetadata.cacheControl);
+      headers.set("Content-Type", legacyObject.httpMetadata?.contentType ?? "application/octet-stream");
+      const legacyCacheControl = legacyObject.httpMetadata?.cacheControl;
+      if (legacyCacheControl) {
+        headers.set("Cache-Control", String(legacyCacheControl));
       }
-      return wrapWithCors(new Response(obj.body, { headers, status: 200 }));
+      return wrapWithCors(new Response(legacyObject.body, { headers, status: 200 }));
     } catch (e) {
       return wrapWithCors(
         c.json({ error: "internal_error", message: `R2 读取失败: ${(e as Error).message}` }, 500),
@@ -240,6 +370,7 @@ export function createApp() {
 
     const repo = createRepository(c.env.DB);
     const localDevHost = c.env.LOCAL_DEV_HOST ?? "";
+    await recoverPendingCommit(spaceId, { repo, r2Bucket: c.env.BLOB_STORE });
 
     const maxMutationsPerBatch = parseInt(
       c.env.MAX_MUTATIONS_PER_BATCH ?? String(DEFAULT_MAX_MUTATIONS_PER_BATCH),
@@ -252,13 +383,8 @@ export function createApp() {
 
     const result = await handlePlan(spaceId, assetTypes, {
       repo,
-      presignedUrlConfig: {
-        accountId: c.env.R2_ACCOUNT_ID ?? "",
-        accessKeyId: c.env.R2_ACCESS_KEY_ID ?? "",
-        secretAccessKey: c.env.R2_SECRET_ACCESS_KEY ?? "",
-        bucketName: c.env.R2_BUCKET_NAME ?? "industrial-sync-blobs",
-      },
-      localDevHost: localDevHost || undefined,
+      commitTokenSecret: requireCommitTokenSecret(c.env),
+      publicBaseUrl: publicBaseUrl(c),
       capabilities: {
         protocol: c.env.PROTOCOL_VERSION ?? "cf-sync-v1",
         maxMutationsPerBatch,
@@ -266,6 +392,9 @@ export function createApp() {
         supportedStorageModes: ["full"],
         supportedEncodings: ["identity"],
         schemaVersions: [1],
+        r2EnterThresholdBytes: storageConfig(c.env).r2EnterThresholdBytes,
+        d1ReturnThresholdBytes: storageConfig(c.env).d1ReturnThresholdBytes,
+        maxR2BlobBytes: storageConfig(c.env).maxR2BlobBytes,
       },
     });
 
@@ -375,6 +504,10 @@ export function createApp() {
         // 调用 service 层
         const repo = createRepository(c.env.DB);
         const localDevHost = c.env.LOCAL_DEV_HOST ?? "";
+        await recoverPendingCommit(c.req.param("spaceId"), {
+          repo,
+          r2Bucket: c.env.BLOB_STORE,
+        });
         const result = await handlePrepare(
           c.req.param("spaceId"),
           (body.spaceEpoch as string) ?? (body.epoch as string) ?? "",
@@ -382,15 +515,12 @@ export function createApp() {
           mutations as PrepareMutation[],
           {
             repo,
-            commitTokenSecret: c.env.COMMIT_TOKEN_SECRET ?? "dev-secret-key-32-bytes-long!!",
-            presignedUrlConfig: {
-              accountId: c.env.R2_ACCOUNT_ID ?? "",
-              accessKeyId: c.env.R2_ACCESS_KEY_ID ?? "",
-              secretAccessKey: c.env.R2_SECRET_ACCESS_KEY ?? "",
-              bucketName: c.env.R2_BUCKET_NAME ?? "industrial-sync-blobs",
-            },
-            localDevHost: localDevHost || undefined,
+            // AI-CORRECTION 2026-08-08: active 协议不再使用可预测的 fallback HMAC secret。
+            commitTokenSecret: requireCommitTokenSecret(c.env),
+            r2Bucket: c.env.BLOB_STORE,
+            publicBaseUrl: publicBaseUrl(c),
             now: Date.now(),
+            storageConfig: storageConfig(c.env),
           },
         );
 
@@ -401,7 +531,7 @@ export function createApp() {
       }
 
       case "commit": {
-        const commitReq = body as CommitMutationsRequest;
+        const commitReq = body as unknown as CommitMutationsRequest;
         if (!commitReq.commitToken) {
           return wrapWithCors(
             c.json(
@@ -428,10 +558,11 @@ export function createApp() {
           commitReq.mutations,
           {
             repo,
-            commitTokenSecret: c.env.COMMIT_TOKEN_SECRET ?? "dev-secret-key-32-bytes-long!!",
+            commitTokenSecret: requireCommitTokenSecret(c.env),
             r2Bucket: c.env.BLOB_STORE,
             now: Date.now(),
             presentTime: new Date().toISOString(),
+            storageConfig: storageConfig(c.env),
           },
         );
 
@@ -478,16 +609,12 @@ export function createApp() {
     const spaceId = c.req.param("spaceId");
     const repo = createRepository(c.env.DB);
     const localDevHost = c.env.LOCAL_DEV_HOST ?? "";
+    await recoverPendingCommit(spaceId, { repo, r2Bucket: c.env.BLOB_STORE });
 
     const result = await handleDownloadsSign(spaceId, blobHashes, {
       repo,
-      presignedUrlConfig: {
-        accountId: c.env.R2_ACCOUNT_ID ?? "",
-        accessKeyId: c.env.R2_ACCESS_KEY_ID ?? "",
-        secretAccessKey: c.env.R2_SECRET_ACCESS_KEY ?? "",
-        bucketName: c.env.R2_BUCKET_NAME ?? "industrial-sync-blobs",
-      },
-      localDevHost: localDevHost || undefined,
+      commitTokenSecret: requireCommitTokenSecret(c.env),
+      publicBaseUrl: publicBaseUrl(c),
     });
 
     if (!result) {
@@ -496,6 +623,52 @@ export function createApp() {
       );
     }
 
+    return wrapWithCors(c.json(result, 200));
+  });
+
+  // 资产删除 — 建立 D1 屏障后删除固定 R2 key，并发布 tombstone/head
+  app.delete("/v1/sync/spaces/:spaceId/assets/:assetType/:assetId", async (c) => {
+    const contentType = c.req.header("content-type") ?? "";
+    if (!contentType.includes("application/json")) {
+      throw new StorageProtocolError(400, "bad_request", "需要 Content-Type: application/json");
+    }
+
+    let body: DeleteAssetRequest;
+    try {
+      body = await c.req.json<DeleteAssetRequest>();
+    } catch {
+      throw new StorageProtocolError(400, "bad_request", "请求体不是合法 JSON");
+    }
+    if (!body.spaceEpoch || typeof body.spaceEpoch !== "string") {
+      throw new StorageProtocolError(400, "bad_request", "缺少 spaceEpoch");
+    }
+    if (!Number.isSafeInteger(body.expectedRevision) || body.expectedRevision < 1) {
+      throw new StorageProtocolError(400, "bad_request", "expectedRevision 必须是正整数");
+    }
+    const expectedContentHash = body.expectedContentHash ?? null;
+    if (
+      expectedContentHash !== null &&
+      (typeof expectedContentHash !== "string" || !/^[0-9a-f]{64}$/.test(expectedContentHash))
+    ) {
+      throw new StorageProtocolError(400, "bad_request", "expectedContentHash 必须是小写 SHA-256");
+    }
+
+    const result = await handleDeleteAsset(
+      c.req.param("spaceId"),
+      c.req.param("assetType"),
+      c.req.param("assetId"),
+      {
+        spaceEpoch: body.spaceEpoch,
+        expectedRevision: body.expectedRevision,
+        expectedContentHash,
+      },
+      {
+        repo: createRepository(c.env.DB),
+        r2Bucket: c.env.BLOB_STORE,
+        now: Date.now(),
+        storageConfig: storageConfig(c.env),
+      },
+    );
     return wrapWithCors(c.json(result, 200));
   });
 
@@ -509,6 +682,7 @@ export function createApp() {
 
     const spaceId = c.req.param("spaceId");
     const repo = createRepository(c.env.DB);
+    await recoverPendingCommit(spaceId, { repo, r2Bucket: c.env.BLOB_STORE });
     const result = await handleReset(spaceId, { repo });
 
     if (!result) {

@@ -10,6 +10,7 @@ database_name = "sync-db"
 database_id = "34197a80-811a-4e06-bbc8-c633b8db1044"
 
 # R2 存储：不可变 payload
+# AI-CORRECTION 2026-08-08: RQ-007 改为每资产固定 key 的最新态覆盖，不再按 hash 永久新增。
 [[r2_buckets]]
 binding = "BLOB_STORE"
 bucket_name = "industrial-sync-blobs"
@@ -19,6 +20,11 @@ bucket_name = "industrial-sync-blobs"
 PROTOCOL_VERSION = "cf-sync-v1"
 MAX_MUTATIONS_PER_BATCH = "32"
 MAX_METADATA_SIZE = "262144"
+R2_ENTER_THRESHOLD_BYTES = "614400"
+D1_RETURN_THRESHOLD_BYTES = "552960"
+MAX_BATCH_D1_BLOB_BYTES = "8388608"
+MAX_R2_BLOB_BYTES = "26214400"
+RETENTION_HEAD_WINDOW = "1000"
 # LOCAL_DEV_HOST 仅通过 .dev.vars（本地）或 K8s 环境变量（Beta）注入
 # 不在此处设默认值，避免 wrangler dev 覆盖环境变量
 

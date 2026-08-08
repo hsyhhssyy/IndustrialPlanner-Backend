@@ -1,7 +1,7 @@
 // service.ts — handlePrepare 业务场景测试
 
 import { describe, it, expect, vi } from "vitest";
-import { handlePrepare, handleCommit, type HandleCommitDeps } from "./service";
+import { handlePrepare, handleCommitLegacyForAudit as handleCommit, type HandleCommitDeps } from "./service";
 import type { SyncRepository, SpaceRow, AssetHeadRow, MutationResultRow, CommitVersionInput } from "./repository";
 import type { PresignedUrlConfig } from "./presigned_url";
 import type { PrepareMutation } from "./model";
@@ -29,10 +29,31 @@ function mockRepo(overrides?: Partial<SyncRepository>): SyncRepository {
     resetSpace: vi.fn().mockResolvedValue(null),
     upsertAssetHead: vi.fn(),
     getAssetHead: vi.fn().mockResolvedValue(null),
+    getAssetStorage: vi.fn().mockResolvedValue(null),
+    findAssetStorageByCurrentHash: vi.fn().mockResolvedValue(null),
     listAssetHeads: vi.fn().mockResolvedValue([]),
     listChangedAssetHeads: vi.fn().mockResolvedValue([]),
     getMutationResult: vi.fn().mockResolvedValue(null),
     insertMutationResult: vi.fn(),
+    getUploadSession: vi.fn().mockResolvedValue(null),
+    getUploadSessionForAsset: vi.fn().mockResolvedValue(null),
+    createUploadSession: vi.fn(),
+    deleteUploadSession: vi.fn(),
+    claimUploadSession: vi.fn().mockResolvedValue(true),
+    releaseUploadSession: vi.fn(),
+    setUploadMultipartId: vi.fn(),
+    markD1UploadReady: vi.fn(),
+    markR2UploadReady: vi.fn(),
+    commitPureD1Batch: vi.fn().mockResolvedValue([]),
+    reserveTieredCommit: vi.fn(),
+    getCommitIntent: vi.fn().mockResolvedValue(null),
+    getPendingCommitIntent: vi.fn().mockResolvedValue(null),
+    markCommitIntentState: vi.fn(),
+    finalizeTieredCommit: vi.fn().mockResolvedValue([]),
+    reserveAssetDelete: vi.fn(),
+    getPendingDeleteIntent: vi.fn().mockResolvedValue(null),
+    markDeleteIntentState: vi.fn(),
+    finalizeAssetDelete: vi.fn(),
     commitBatch: vi.fn().mockResolvedValue([]),
     getModuleHeads: vi.fn().mockResolvedValue([]),
     listChanges: vi.fn().mockResolvedValue([]),
