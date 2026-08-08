@@ -44,7 +44,16 @@ app.all("*", (c) => {
 // 全局 CORS 包装
 export default {
   fetch: async (request: Request, env: Record<string, unknown>) => {
-    const response = await app.fetch(request, env);
-    return withCors(response);
+    try {
+      const response = await app.fetch(request, env);
+      return withCors(response);
+    } catch (e) {
+      // 异常也必须带 CORS 头，否则浏览器报 CORS 错误而非真正的错误信息
+      const errorResponse = new Response(
+        JSON.stringify({ error: "bad_gateway", message: `网关转发异常: ${(e as Error).message}` }),
+        { status: 502, headers: { "content-type": "application/json" } },
+      );
+      return withCors(errorResponse);
+    }
   },
 };
