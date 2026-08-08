@@ -395,6 +395,9 @@ describe("RQ-007 最新态 D1/R2 与下载链路", () => {
     });
     expect(recovered?.[0]).toMatchObject({ contentHash: mutation.blobHash });
     expect((await repository.getSpaceHead(SPACE_ID))?.pendingCommitId).toBeNull();
+    expect(await db.prepare(
+      "SELECT 1 FROM sync_commit_intents WHERE space_id = ?1",
+    ).bind(SPACE_ID).first()).toBeNull();
     expect((await r2.list({ prefix: key })).objects.map((object) => object.key)).toEqual([key]);
 
     const committed = await repository.getAssetHead(SPACE_ID, EPOCH, ASSET_TYPE, ASSET_ID);
@@ -540,6 +543,9 @@ describe("RQ-007 最新态 D1/R2 与下载链路", () => {
     expect(tombstone?.revision).toBe(currentAsset.revision + 1);
     expect(tombstone?.content_hash).toBeNull();
     expect(tombstone?.deleted_at).toBe(deleted.deletedAt);
+    expect(await db.prepare(
+      "SELECT 1 FROM sync_delete_intents WHERE space_id = ?1",
+    ).bind(SPACE_ID).first()).toBeNull();
 
     const staleDownload = await worker.fetch(new Request(currentDownloadUrl), env());
     expect(staleDownload.status).toBe(410);

@@ -1534,11 +1534,9 @@ export function createRepository(db: D1Database): SyncRepository {
           input.expectedHead,
           input.commitId,
         ),
-        db.prepare(
-          `UPDATE sync_commit_intents
-           SET state = 'complete', last_error = NULL, updated_at = ?2
-           WHERE commit_id = ?1 AND state != 'complete'`,
-        ).bind(input.commitId, input.committedAt),
+        // AI-CORRECTION 2026-08-08: Finalize 后幂等由 mutation result 承担；删除 intent，避免按编辑次数累积。
+        db.prepare("DELETE FROM sync_commit_intents WHERE commit_id = ?1")
+          .bind(input.commitId),
         db.prepare("DELETE FROM sync_commit_guards WHERE commit_id = ?1")
           .bind(finalizeGuardId),
       );
@@ -1771,11 +1769,9 @@ export function createRepository(db: D1Database): SyncRepository {
           `DELETE FROM sync_mutation_results
            WHERE space_id = ?1 AND applied_head < ?2`,
         ).bind(input.spaceId, minRetainedHead),
-        db.prepare(
-          `UPDATE sync_delete_intents
-           SET state = 'complete', updated_at = ?2
-           WHERE delete_id = ?1 AND state != 'complete'`,
-        ).bind(input.deleteId, input.deletedAt),
+        // AI-CORRECTION 2026-08-08: tombstone 是删除幂等真相；Finalize 后不保留按删除次数增长的 intent。
+        db.prepare("DELETE FROM sync_delete_intents WHERE delete_id = ?1")
+          .bind(input.deleteId),
         db.prepare("DELETE FROM sync_commit_guards WHERE commit_id = ?1")
           .bind(guardId),
       ];
