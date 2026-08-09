@@ -283,6 +283,10 @@ export interface SyncRepository {
     assetId: string,
   ): Promise<UploadSessionRow | null>;
   createUploadSession(session: UploadSessionRow): Promise<void>;
+  replaceIssuedUploadSession(
+    expectedSessionId: string,
+    replacement: UploadSessionRow,
+  ): Promise<boolean>;
   deleteUploadSession(sessionId: string): Promise<void>;
   claimUploadSession(
     sessionId: string,
@@ -1233,6 +1237,46 @@ export function createRepository(db: D1Database): SyncRepository {
           session.updatedAt,
         )
         .run();
+    },
+
+    async replaceIssuedUploadSession(
+      expectedSessionId: string,
+      replacement: UploadSessionRow,
+    ): Promise<boolean> {
+      const result = await db
+        .prepare(
+          `UPDATE sync_upload_sessions
+           SET session_id = ?2, epoch = ?3,
+               source_backend = ?4, target_backend = ?5, object_key = ?6,
+               blob_hash = ?7, byte_size = ?8, encoding = ?9,
+               r2_multipart_upload_id = NULL, part_etag = NULL, d1_content = NULL,
+               state = 'issued', lease_expires_at = NULL,
+               expires_at = ?10, created_at = ?11, updated_at = ?12
+           WHERE session_id = ?1
+             AND space_id = ?13 AND asset_type = ?14 AND asset_id = ?15
+             AND state = 'issued' AND lease_expires_at IS NULL
+             AND r2_multipart_upload_id IS NULL AND part_etag IS NULL
+             AND d1_content IS NULL`,
+        )
+        .bind(
+          expectedSessionId,
+          replacement.sessionId,
+          replacement.epoch,
+          replacement.sourceBackend,
+          replacement.targetBackend,
+          replacement.objectKey,
+          replacement.blobHash,
+          replacement.byteSize,
+          replacement.encoding,
+          replacement.expiresAt,
+          replacement.createdAt,
+          replacement.updatedAt,
+          replacement.spaceId,
+          replacement.assetType,
+          replacement.assetId,
+        )
+        .run();
+      return (result.meta?.changes ?? 0) === 1;
     },
 
     async deleteUploadSession(sessionId: string): Promise<void> {

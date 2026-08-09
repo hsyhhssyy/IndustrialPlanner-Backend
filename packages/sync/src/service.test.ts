@@ -2,7 +2,14 @@
 
 import { describe, it, expect, vi } from "vitest";
 import { handlePrepare, handleCommitLegacyForAudit as handleCommit, type HandleCommitDeps } from "./service";
-import type { SyncRepository, SpaceRow, AssetHeadRow, MutationResultRow, CommitVersionInput } from "./repository";
+import type {
+  SyncRepository,
+  SpaceRow,
+  AssetHeadRow,
+  MutationResultRow,
+  CommitVersionInput,
+  UploadSessionRow,
+} from "./repository";
 import type { PresignedUrlConfig } from "./presigned_url";
 import type { PrepareMutation } from "./model";
 import { signCommitToken } from "./commit_token";
@@ -38,6 +45,7 @@ function mockRepo(overrides?: Partial<SyncRepository>): SyncRepository {
     getUploadSession: vi.fn().mockResolvedValue(null),
     getUploadSessionForAsset: vi.fn().mockResolvedValue(null),
     createUploadSession: vi.fn(),
+    replaceIssuedUploadSession: vi.fn().mockResolvedValue(false),
     deleteUploadSession: vi.fn(),
     claimUploadSession: vi.fn().mockResolvedValue(true),
     releaseUploadSession: vi.fn(),
@@ -79,6 +87,33 @@ function newMutation(
     encoding: "identity",
     writerAppVersion: "1.0.0",
     writerBuildId: "build-1",
+    ...overrides,
+  };
+}
+
+function issuedSession(
+  overrides?: Partial<UploadSessionRow>,
+): UploadSessionRow {
+  return {
+    sessionId: "session-old",
+    spaceId: "test-space",
+    epoch: "epoch-1",
+    assetType: "blueprint",
+    assetId: "bp-001",
+    sourceBackend: "d1",
+    targetBackend: "d1",
+    objectKey: "sync/v2/test-space/blueprint/bp-001/payload",
+    blobHash: "old-blob-hash",
+    byteSize: 90,
+    encoding: "identity",
+    r2MultipartUploadId: null,
+    partEtag: null,
+    d1Content: null,
+    state: "issued",
+    leaseExpiresAt: null,
+    expiresAt: new Date(MOCK_NOW + 15 * 60_000).toISOString(),
+    createdAt: new Date(MOCK_NOW - 60_000).toISOString(),
+    updatedAt: new Date(MOCK_NOW - 60_000).toISOString(),
     ...overrides,
   };
 }
@@ -187,6 +222,45 @@ describe("handlePrepare", () => {
       expect(result.alreadyApplied).toHaveLength(1);
       expect(result.alreadyApplied![0]?.clientMutationId).toBe("cm-already");
       expect(result.uploads).toHaveLength(0);
+    });
+
+    it("不同 descriptor 可原子替换尚未 claim 的 issued session", async () => {
+      const replaceIssuedUploadSession = vi.fn().mockResolvedValue(true);
+      const repo = mockRepo({
+        getUploadSessionForAsset: vi.fn().mockResolvedValue(issuedSession()),
+        replaceIssuedUploadSession,
+      });
+
+      const mutation = newMutation();
+      const result = await handlePrepare("test-space", "epoch-1", "batch-replace", [
+        mutation,
+      ], {
+        repo,
+        commitTokenSecret: MOCK_TOKEN_SECRET,
+        presignedUrlConfig: {
+          accountId: "test-account",
+          accessKeyId: "test-key",
+          secretAccessKey: "test-secret",
+          bucketName: "test-bucket",
+        },
+        now: MOCK_NOW,
+      });
+
+      expect(result.status).toBe("ready");
+      expect(replaceIssuedUploadSession).toHaveBeenCalledOnce();
+      const [expectedSessionId, replacement] = replaceIssuedUploadSession.mock.calls[0]!;
+      expect(expectedSessionId).toBe("session-old");
+      expect(replacement).toMatchObject({
+        state: "issued",
+        blobHash: mutation.blobHash,
+        byteSize: mutation.blobByteSize,
+        d1Content: null,
+        r2MultipartUploadId: null,
+        leaseExpiresAt: null,
+      });
+      expect(replacement.sessionId).not.toBe("session-old");
+      expect(result.uploads?.[0]?.sessionId).toBe(replacement.sessionId);
+      expect(repo.createUploadSession).not.toHaveBeenCalled();
     });
   });
 
@@ -317,6 +391,33 @@ describe("handlePrepare", () => {
       });
 
       expect(result.status).toBe("conflict");
+    });
+
+    it("旧 PUT 已 claim 时原子替换失败 → upload-in-progress", async () => {
+      const replaceIssuedUploadSession = vi.fn().mockResolvedValue(false);
+      const repo = mockRepo({
+        getUploadSessionForAsset: vi.fn().mockResolvedValue(issuedSession()),
+        replaceIssuedUploadSession,
+      });
+
+      const result = await handlePrepare("test-space", "epoch-1", "batch-raced", [
+        newMutation(),
+      ], {
+        repo,
+        commitTokenSecret: MOCK_TOKEN_SECRET,
+        presignedUrlConfig: {
+          accountId: "test-account",
+          accessKeyId: "test-key",
+          secretAccessKey: "test-secret",
+          bucketName: "test-bucket",
+        },
+        now: MOCK_NOW,
+      });
+
+      expect(result.status).toBe("conflict");
+      expect(result.conflicts?.[0]?.reason).toBe("upload-in-progress");
+      expect(replaceIssuedUploadSession).toHaveBeenCalledOnce();
+      expect(repo.createUploadSession).not.toHaveBeenCalled();
     });
   });
 

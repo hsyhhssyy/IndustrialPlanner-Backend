@@ -10,6 +10,7 @@ import {
   type SpaceRow,
   type AssetHeadRow,
   type MutationResultRow,
+  type UploadSessionRow,
 } from "./repository";
 
 let db: D1Database;
@@ -229,6 +230,70 @@ describe("repository — D1 操作", () => {
         "nonexistent",
       );
       expect(result).toBeNull();
+    });
+  });
+
+  describe("replaceIssuedUploadSession", () => {
+    it("只替换未 claim 且没有暂存数据的 issued session", async () => {
+      const original: UploadSessionRow = {
+        sessionId: "replace-session-old",
+        spaceId: "test-space",
+        epoch: "epoch-1",
+        assetType: "blueprint",
+        assetId: "replace-asset",
+        sourceBackend: "d1",
+        targetBackend: "d1",
+        objectKey: "sync/v2/test-space/blueprint/replace-asset/payload",
+        blobHash: "old-hash",
+        byteSize: 8,
+        encoding: "identity",
+        r2MultipartUploadId: null,
+        partEtag: null,
+        d1Content: null,
+        state: "issued",
+        leaseExpiresAt: null,
+        expiresAt: "2026-08-09T09:00:00Z",
+        createdAt: "2026-08-09T08:00:00Z",
+        updatedAt: "2026-08-09T08:00:00Z",
+      };
+      await repo.createUploadSession(original);
+
+      const replacement: UploadSessionRow = {
+        ...original,
+        sessionId: "replace-session-new",
+        blobHash: "new-hash",
+        byteSize: 9,
+        expiresAt: "2026-08-09T09:01:00Z",
+        createdAt: "2026-08-09T08:01:00Z",
+        updatedAt: "2026-08-09T08:01:00Z",
+      };
+      expect(await repo.replaceIssuedUploadSession(original.sessionId, replacement)).toBe(true);
+      expect(await repo.getUploadSession(original.sessionId)).toBeNull();
+      expect(await repo.getUploadSession(replacement.sessionId)).toMatchObject({
+        blobHash: "new-hash",
+        byteSize: 9,
+        state: "issued",
+      });
+
+      expect(await repo.claimUploadSession(
+        replacement.sessionId,
+        "2026-08-09T08:01:01Z",
+        "2026-08-09T08:02:01Z",
+      )).toBe(true);
+      const racedReplacement: UploadSessionRow = {
+        ...replacement,
+        sessionId: "replace-session-raced",
+        blobHash: "raced-hash",
+      };
+      expect(await repo.replaceIssuedUploadSession(
+        replacement.sessionId,
+        racedReplacement,
+      )).toBe(false);
+      expect(await repo.getUploadSession(replacement.sessionId)).toMatchObject({
+        state: "uploading",
+        blobHash: "new-hash",
+      });
+      expect(await repo.getUploadSession(racedReplacement.sessionId)).toBeNull();
     });
   });
 

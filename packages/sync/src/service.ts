@@ -1055,6 +1055,39 @@ async function discardExpiredUploadSession(
   await deps.repo.deleteUploadSession(session.sessionId);
 }
 
+function createIssuedUploadSession(input: {
+  spaceId: string;
+  epoch: string;
+  mutation: PrepareMutation;
+  sourceBackend: StorageBackend;
+  targetBackend: StorageBackend;
+  objectKey: string;
+  now: number;
+}): UploadSessionRow {
+  const createdAt = new Date(input.now).toISOString();
+  return {
+    sessionId: crypto.randomUUID(),
+    spaceId: input.spaceId,
+    epoch: input.epoch,
+    assetType: input.mutation.assetType,
+    assetId: input.mutation.assetId,
+    sourceBackend: input.sourceBackend,
+    targetBackend: input.targetBackend,
+    objectKey: input.objectKey,
+    blobHash: input.mutation.blobHash,
+    byteSize: input.mutation.blobByteSize,
+    encoding: input.mutation.encoding,
+    r2MultipartUploadId: null,
+    partEtag: null,
+    d1Content: null,
+    state: "issued",
+    leaseExpiresAt: null,
+    expiresAt: new Date(input.now + 15 * 60_000).toISOString(),
+    createdAt,
+    updatedAt: createdAt,
+  };
+}
+
 export async function handlePrepare(
   spaceId: string,
   requestEpoch: string,
@@ -1173,8 +1206,27 @@ export async function handlePrepare(
         fixedR2Key,
         requestEpoch,
       )) {
-        conflicts.push(conflictFor(mutation, "upload-in-progress", currentAsset));
-        continue;
+        // AI-CORRECTION 2026-08-09: 尚未 claim、没有任何暂存数据的 issued session
+        // 不代表正在上传。新 descriptor 通过 repository 条件 UPDATE 原子替换它；
+        // 若旧 PUT 已抢先 claim，替换会失败并维持 upload-in-progress。
+        const replacement = createIssuedUploadSession({
+          spaceId,
+          epoch: requestEpoch,
+          mutation,
+          sourceBackend,
+          targetBackend,
+          objectKey: fixedR2Key,
+          now: deps.now,
+        });
+        const replaced = await deps.repo.replaceIssuedUploadSession(
+          session.sessionId,
+          replacement,
+        );
+        if (!replaced) {
+          conflicts.push(conflictFor(mutation, "upload-in-progress", currentAsset));
+          continue;
+        }
+        session = replacement;
       }
       if (session?.state === "reserved") {
         conflicts.push(conflictFor(mutation, "storage-busy", currentAsset));
@@ -1182,28 +1234,15 @@ export async function handlePrepare(
       }
 
       if (!session) {
-        const createdAt = new Date(deps.now).toISOString();
-        session = {
-          sessionId: crypto.randomUUID(),
+        session = createIssuedUploadSession({
           spaceId,
           epoch: requestEpoch,
-          assetType: mutation.assetType,
-          assetId: mutation.assetId,
+          mutation,
           sourceBackend,
           targetBackend,
           objectKey: fixedR2Key,
-          blobHash: mutation.blobHash,
-          byteSize: mutation.blobByteSize,
-          encoding: mutation.encoding,
-          r2MultipartUploadId: null,
-          partEtag: null,
-          d1Content: null,
-          state: "issued",
-          leaseExpiresAt: null,
-          expiresAt: new Date(deps.now + 15 * 60_000).toISOString(),
-          createdAt,
-          updatedAt: createdAt,
-        };
+          now: deps.now,
+        });
         await deps.repo.createUploadSession(session);
       }
 

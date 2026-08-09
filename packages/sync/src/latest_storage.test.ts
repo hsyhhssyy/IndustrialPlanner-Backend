@@ -247,6 +247,84 @@ describe("RQ-007 最新态 D1/R2 与下载链路", () => {
     }
   });
 
+  it("不同 descriptor 原子替换未 claim 的 issued session，旧 ticket 随即失效", async () => {
+    const assetId = "replace-issued-session";
+    const prepareMutation = async (
+      bytes: Uint8Array,
+      clientMutationId: string,
+    ): Promise<{ mutation: PrepareMutation; response: Response; body: Record<string, any> }> => {
+      const mutation = {
+        ...await mutationFor(bytes, clientMutationId, null, null),
+        assetId,
+      };
+      const response = await request(`/v1/sync/spaces/${SPACE_ID}/mutations`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          protocol: "cf-sync-v1",
+          action: "prepare",
+          spaceEpoch: EPOCH,
+          clientBatchId: `batch-${clientMutationId}`,
+          mutations: [mutation],
+        }),
+      });
+      return {
+        mutation,
+        response,
+        body: await response.json() as Record<string, any>,
+      };
+    };
+
+    try {
+      const oldBytes = new TextEncoder().encode("old-issued-payload");
+      const oldPrepare = await prepareMutation(oldBytes, "m-issued-old");
+      expect(oldPrepare.response.status).toBe(200);
+      const oldUpload = oldPrepare.body.uploads[0];
+      expect(oldUpload.required).toBe(true);
+
+      const samePrepare = await prepareMutation(oldBytes, "m-issued-same");
+      expect(samePrepare.response.status).toBe(200);
+      expect(samePrepare.body.uploads[0].sessionId).toBe(oldUpload.sessionId);
+
+      const newBytes = new TextEncoder().encode("new-issued-payload");
+      const newPrepare = await prepareMutation(newBytes, "m-issued-new");
+      expect(newPrepare.response.status).toBe(200);
+      const newUpload = newPrepare.body.uploads[0];
+      expect(newUpload.sessionId).not.toBe(oldUpload.sessionId);
+
+      const oldTicketResponse = await worker.fetch(new Request(oldUpload.url, {
+        method: "PUT",
+        headers: oldUpload.headers,
+        body: oldBytes,
+      }), env());
+      expect(oldTicketResponse.status).toBe(409);
+      expect(await oldTicketResponse.json()).toMatchObject({
+        error: "upload_session_mismatch",
+      });
+
+      const newUploadResponse = await worker.fetch(new Request(newUpload.url, {
+        method: "PUT",
+        headers: newUpload.headers,
+        body: newBytes,
+      }), env());
+      expect(newUploadResponse.status).toBe(200);
+
+      const blockedPrepare = await prepareMutation(
+        new TextEncoder().encode("third-payload"),
+        "m-issued-blocked",
+      );
+      expect(blockedPrepare.response.status).toBe(409);
+      expect(blockedPrepare.body).toMatchObject({
+        status: "conflict",
+        conflicts: [{ reason: "upload-in-progress" }],
+      });
+    } finally {
+      await db.prepare(
+        "DELETE FROM sync_upload_sessions WHERE space_id = ?1 AND asset_type = ?2 AND asset_id = ?3",
+      ).bind(SPACE_ID, ASSET_TYPE, assetId).run();
+    }
+  });
+
   it("小文件走 D1，下载必须持有当前版本票据", async () => {
     const bytes = new TextEncoder().encode("d1-current-payload");
     const mutation = await mutationFor(bytes, "m-d1-1", null, null);
