@@ -20,7 +20,7 @@ describe("10ms CPU 时间预算验证", () => {
       await measureRequest("GET /health", () =>
         worker.default.fetch(
           new Request("https://localhost/health"),
-          { DB: createMockDb(), RATE_LIMIT: createMockKv() },
+          { DB: createMockDb() },
         ),
       ),
     );
@@ -34,7 +34,7 @@ describe("10ms CPU 时间预算验证", () => {
             headers: { "content-type": "application/json", "cf-connecting-ip": "1.2.3.4" },
             body: VALID_BODY,
           }),
-          { DB: createMockDb(), RATE_LIMIT: createMockKv() },
+          { DB: createMockDb() },
         ),
       ),
     );
@@ -48,7 +48,7 @@ describe("10ms CPU 时间预算验证", () => {
             headers: { "content-type": "application/json", "cf-connecting-ip": "1.2.3.4" },
             body: "not json",
           }),
-          { DB: createMockDb(), RATE_LIMIT: createMockKv() },
+          { DB: createMockDb() },
         ),
       ),
     );
@@ -82,13 +82,5 @@ function createMockDb() {
     }),
     exec: async () => ({ success: true }),
     batch: async () => [],
-  };
-}
-
-function createMockKv() {
-  const store = new Map<string, string>();
-  return {
-    get: async (key: string) => store.get(key) ?? null,
-    put: async (key: string, value: string) => { store.set(key, value); },
   };
 }

@@ -5,6 +5,7 @@ import type {
   CommitResult,
   DeleteItemRow,
   SpaceRow,
+  TransactionInfo,
   UploadBatchRow,
   UploadItemRow,
 } from "./space_model";
@@ -49,6 +50,10 @@ export interface SpaceRepository {
   beginCancel(uploadId: string, now: string): Promise<boolean>;
   finishCancel(uploadId: string, now: string): Promise<void>;
   setBatchError(uploadId: string, error: string, now: string): Promise<void>;
+  /** 获取当前活跃事务详情（含 item/deletion 计数） */
+  getTransactionDetail(spaceId: string): Promise<TransactionInfo | null>;
+  /** 强制丢弃：允许 prepared 或 committing → cancelling */
+  beginForceAbort(uploadId: string, now: string): Promise<boolean>;
   checkHealth(): Promise<boolean>;
 }
 
@@ -595,6 +600,49 @@ export function createSpaceRepository(db: D1Database): SpaceRepository {
       await db.prepare(
         "UPDATE sync_upload_batches SET last_error=?2,updated_at=?3 WHERE upload_id=?1",
       ).bind(uploadId, error, now).run();
+    },
+
+    async getTransactionDetail(spaceId) {
+      const space = await db.prepare(
+        "SELECT pending_upload_id FROM sync_spaces WHERE space_id=?1",
+      ).bind(spaceId).first<{ pending_upload_id: string | null }>();
+      if (!space?.pending_upload_id) return null;
+      const uploadId = space.pending_upload_id;
+
+      const batch = await this.getBatch(uploadId);
+      if (!batch) return null;
+
+      const [itemCount, deletionCount] = await Promise.all([
+        db.prepare(
+          "SELECT COUNT(*) AS cnt FROM sync_upload_items WHERE upload_id=?1",
+        ).bind(uploadId).first<{ cnt: number }>(),
+        db.prepare(
+          "SELECT COUNT(*) AS cnt FROM sync_delete_items WHERE upload_id=?1",
+        ).bind(uploadId).first<{ cnt: number }>(),
+      ]);
+
+      return {
+        uploadId: batch.uploadId,
+        clientBatchId: batch.clientBatchId,
+        state: batch.state,
+        baseRevision: batch.baseRevision,
+        targetRevision: batch.targetRevision,
+        targetEpoch: batch.targetEpoch,
+        expiresAt: batch.expiresAt,
+        createdAt: batch.createdAt,
+        objectCount: itemCount?.cnt ?? 0,
+        deletionCount: deletionCount?.cnt ?? 0,
+      };
+    },
+
+    async beginForceAbort(uploadId, now) {
+      const result = await db.prepare(
+        `UPDATE sync_upload_batches SET state='cancelling',last_error='force-aborted',updated_at=?2
+         WHERE upload_id=?1 AND state IN ('prepared','committing')`,
+      ).bind(uploadId, now).run();
+      if ((result.meta?.changes ?? 0) === 1) return true;
+      const batch = await this.getBatch(uploadId);
+      return batch?.state === "cancelling";
     },
 
     async checkHealth() {

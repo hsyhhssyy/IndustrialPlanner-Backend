@@ -4,8 +4,6 @@ import type { TelemetryRecord } from "./model";
 import { validateTelemetryV1 } from "./contract";
 import type { TelemetryDb } from "./repository";
 import { insertTelemetry, checkDbHealth } from "./repository";
-import type { RateLimitKv } from "./rate_limit";
-import { checkRateLimit } from "./rate_limit";
 import { parseJsonBody } from "@industrial/shared";
 
 // 遥测上传结果
@@ -17,22 +15,9 @@ export type TelemetryResult =
 export async function handleTelemetryUpload(
   request: Request,
   db: TelemetryDb,
-  kv: RateLimitKv,
   clientIp: string,
 ): Promise<TelemetryResult> {
-  // 1. 限流检查
-  const rateLimit = await checkRateLimit(kv, clientIp);
-  if (!rateLimit.allowed) {
-    return {
-      ok: false,
-      status: 429,
-      error: "too_many_requests",
-      message: "请求过于频繁",
-      retryAfter: rateLimit.retryAfter,
-    };
-  }
-
-  // 2. 解析请求体
+  // 1. 解析请求体
   const bodyResult = await parseJsonBody(request);
   if (!bodyResult.ok) {
     return {
@@ -43,7 +28,7 @@ export async function handleTelemetryUpload(
     };
   }
 
-  // 3. 校验遥测数据
+  // 2. 校验遥测数据
   const validation = validateTelemetryV1(bodyResult.data, clientIp);
   if (!validation.valid) {
     return {
@@ -54,7 +39,7 @@ export async function handleTelemetryUpload(
     };
   }
 
-  // 4. 写入数据库（幂等）
+  // 3. 写入数据库（幂等）
   const insertResult = await insertTelemetry(db, validation.record);
   if (!insertResult.success) {
     return {

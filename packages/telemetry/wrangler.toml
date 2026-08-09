@@ -9,16 +9,18 @@ binding = "DB"
 database_name = "telemetry-db"
 database_id = "b77bba55-8093-48c0-9007-41b59029ad04"
 
-# KV 命名空间：限流计数器
-[[kv_namespaces]]
-binding = "RATE_LIMIT"
-id = "8cd9e8680ddb41d281f0c9c22641a3c3"
-preview_id = "telemetry-rate-limit-preview"  # 本地开发使用
-
 # 路由（生产环境由 gateway 转发，这里用于独立测试）
 # [[routes]]
 # pattern = "telemetry.industrial-planner.local/*"
 # zone_id = ""
+
+[env.beta]
+name = "industrial-telemetry-beta"
+
+[[env.beta.d1_databases]]
+binding = "DB"
+database_name = "telemetry-db-beta"
+database_id = "6da845c8-f6be-4690-a791-deeb4380e459"
 
 [dev]
 port = 8080

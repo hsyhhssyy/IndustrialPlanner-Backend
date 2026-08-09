@@ -7,10 +7,5 @@ compatibility_date = "2025-08-06"
 # binding = "DB"
 # database_name = "identity-db"
 # database_id = ""
-#
-# [[kv_namespaces]]
-# binding = "SESSIONS"
-# id = ""
-
 [dev]
 port = 8789

@@ -184,6 +184,40 @@ export interface PlanResponse {
   serverTime: string;
 }
 
+// ============================================================================
+// 事务查询 & 强制丢弃
+// ============================================================================
+
+export interface TransactionInfo {
+  uploadId: string;
+  clientBatchId: string;
+  state: UploadBatchState;
+  baseRevision: number;
+  targetRevision: number;
+  targetEpoch: number;
+  expiresAt: string;
+  createdAt: string;
+  objectCount: number;
+  deletionCount: number;
+}
+
+export interface TransactionStatusResponse {
+  hasActiveTransaction: boolean;
+  transaction?: TransactionInfo;
+}
+
+export type AbortStatus =
+  | "aborted"
+  | "already-cancelled"
+  | "already-committed"
+  | "no-transaction";
+
+export interface AbortResponse {
+  status: AbortStatus;
+  uploadId?: string;
+  revision?: number;
+}
+
 export interface StorageConfig {
   r2EnterThresholdBytes: number;
   d1ReturnThresholdBytes: number;

@@ -1,6 +1,7 @@
 // Space revision 上传事务用例编排。
 
 import type {
+  AbortResponse,
   AssetRow,
   CommitResult,
   DeleteItemRow,
@@ -10,6 +11,7 @@ import type {
   PrepareResponse,
   SpaceRow,
   StorageConfig,
+  TransactionStatusResponse,
   UploadBatchRow,
   UploadInstruction,
   UploadItemRow,
@@ -754,4 +756,76 @@ export async function cleanupRecoverableBatches(deps: BaseDeps, limit = 50): Pro
   const batches = await deps.repo.listRecoverableBatches(iso(deps.now), limit);
   for (const batch of batches) await recoverBatch(batch, deps);
   return batches.length;
+}
+
+// ============================================================================
+// 事务查询 & 强制丢弃
+// ============================================================================
+
+async function forceCancelInternal(batch: UploadBatchRow, deps: BaseDeps): Promise<boolean> {
+  if (batch.state === "cancelled") return true;
+  if (batch.state === "committed") return false;
+  const now = iso(deps.now);
+  if (!await deps.repo.beginForceAbort(batch.uploadId, now)) return false;
+  const items = await deps.repo.listItems(batch.uploadId);
+  for (const item of items) {
+    if (!item.r2MultipartUploadId) continue;
+    try {
+      await deps.r2Bucket.resumeMultipartUpload(item.objectKey, item.r2MultipartUploadId).abort();
+    } catch {
+      // multipart 可能已经由 R2 回收；取消仍可继续释放 D1 租约。
+    }
+  }
+  await deps.repo.finishCancel(batch.uploadId, now);
+  return true;
+}
+
+export async function getSpaceTransaction(
+  spaceId: string,
+  deps: BaseDeps,
+): Promise<TransactionStatusResponse> {
+  const space = await deps.repo.getSpace(spaceId);
+  if (!space) throw new SpaceProtocolError(404, "space_not_found", "空间不存在");
+
+  const detail = await deps.repo.getTransactionDetail(spaceId);
+  if (!detail) return { hasActiveTransaction: false };
+
+  return { hasActiveTransaction: true, transaction: detail };
+}
+
+export async function abortSpaceTransaction(
+  spaceId: string,
+  deps: BaseDeps,
+): Promise<AbortResponse> {
+  const space = await deps.repo.getSpace(spaceId);
+  if (!space) throw new SpaceProtocolError(404, "space_not_found", "空间不存在");
+
+  if (!space.pendingUploadId) return { status: "no-transaction" };
+
+  const uploadId = space.pendingUploadId;
+  const batch = await deps.repo.getBatch(uploadId);
+  if (!batch) {
+    // pending_upload_id 指向一个不存在的 batch —— 脏数据，直接清理锁
+    const now = iso(deps.now);
+    await deps.repo.beginForceAbort(uploadId, now);
+    await deps.repo.finishCancel(uploadId, now);
+    return { status: "aborted", uploadId };
+  }
+
+  if (batch.state === "committed") {
+    return { status: "already-committed", uploadId, revision: batch.targetRevision };
+  }
+  if (batch.state === "cancelled") {
+    return { status: "already-cancelled", uploadId };
+  }
+  if (batch.state === "cancelling") {
+    await cancelInternal(batch, deps);
+    return { status: "already-cancelled", uploadId };
+  }
+
+  // prepared 或 committing → 强制丢弃
+  if (!await forceCancelInternal(batch, deps)) {
+    throw new SpaceProtocolError(409, "abort_failed", "事务丢弃失败，可能已经提交");
+  }
+  return { status: "aborted", uploadId };
 }

@@ -25,6 +25,8 @@ import {
   planSpace,
   prepareSpaceUpload,
   uploadSpaceObject,
+  getSpaceTransaction,
+  abortSpaceTransaction,
 } from "./space_service";
 
 export interface SpaceSyncEnv {
@@ -241,6 +243,18 @@ export function createSpaceSyncApp(): Hono<{ Bindings: SpaceSyncEnv }> {
     if (!ticket) throw new SpaceProtocolError(401, "token_invalid", "缺少下载票据");
     const result = await downloadSpaceObject(c.req.param(), ticket, baseDeps(c.env));
     return wrap(new Response(result.body, { status: 200, headers: result.headers }));
+  });
+
+  // 查询当前事务状态
+  app.get("/v1/sync/spaces/:spaceId/transaction", async (c) => {
+    const result = await getSpaceTransaction(c.req.param("spaceId"), baseDeps(c.env));
+    return wrap(c.json(result, 200));
+  });
+
+  // 立即丢弃当前事务
+  app.post("/v1/sync/spaces/:spaceId/transaction/abort", async (c) => {
+    const result = await abortSpaceTransaction(c.req.param("spaceId"), baseDeps(c.env));
+    return wrap(c.json(result, 200));
   });
 
   app.all("*", (c) => wrap(c.json({ error: "not_found", message: "路径未实现" }, 404)));

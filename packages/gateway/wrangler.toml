@@ -7,9 +7,9 @@ compatibility_date = "2025-08-06"
 # JWT_SECRET = ""  # identity-worker 实现后配置
 
 # 路由：所有流量经 Gateway
-# [[routes]]
-# pattern = "api.industrial-planner.local/*"
-# zone_id = ""
+[[routes]]
+pattern = "endfield-api.anonymous-test.top"
+custom_domain = true
 
 # Service Bindings（其他 Worker 实现后逐步启用）
 # [[services]]
@@ -27,22 +27,13 @@ service = "industrial-sync"
 name = "industrial-gateway-beta"
 workers_dev = true
 
+[[env.beta.routes]]
+pattern = "endfield-api.richetriotour.net"
+custom_domain = true
+
 [[env.beta.services]]
 binding = "SYNC"
 service = "industrial-sync-beta"
-
-# AI-REMOVED 2026-08-09:
-# Reason: 当前 Worker 账号查不到 hsyhhssyy.net zone，Cloudflare 无法创建 custom domain。
-# Trigger: Wrangler deploy 返回 10082，且失败的 trigger 更新会同时关闭 workers.dev。
-# Evidence: Beta token 查询 zones?name=hsyhhssyy.net 成功但结果为空。
-# Replacement: env.beta.workers_dev=true；外部 DNS/zone 权限就绪后再恢复 custom domain。
-# Risk: beta.domain 仍指向旧入口，当前必须使用 industrial-gateway-beta.hsyhhssyy.workers.dev。
-# Human Review: Required
-#
-# Original code:
-# [[env.beta.routes]]
-# pattern = "endfield-api.hsyhhssyy.net"
-# custom_domain = true
 
 # 本地开发时，Service Bindings 指向本地运行的 Worker
 [dev]

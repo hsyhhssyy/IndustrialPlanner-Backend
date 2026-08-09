@@ -11,7 +11,6 @@ import {
 } from "@industrial/shared";
 import { handleTelemetryUpload, handleHealthCheck } from "./service";
 import type { TelemetryDb } from "./repository";
-import type { RateLimitKv } from "./rate_limit";
 
 // 从 Hono context 提取客户端 IP
 function getClientIp(c: Context): string {
@@ -31,7 +30,6 @@ function getClientIp(c: Context): string {
 // Telemetry Worker 依赖类型
 export interface TelemetryEnv {
   DB: TelemetryDb;
-  RATE_LIMIT: RateLimitKv;
 }
 
 export function createApp() {
@@ -57,7 +55,6 @@ export function createApp() {
     const result = await handleTelemetryUpload(
       c.req.raw,
       c.env.DB,
-      c.env.RATE_LIMIT,
       clientIp,
     );
 
