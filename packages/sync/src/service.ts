@@ -1428,6 +1428,11 @@ async function completeIntentR2Objects(
         object = await r2Bucket
           .resumeMultipartUpload(session.objectKey, session.r2MultipartUploadId)
           .complete([{ partNumber: 1, etag: session.partEtag }]);
+        // AI-CORRECTION 2026-08-09: 正式 R2 的 complete 响应可能省略 customMetadata；
+        // 完成态已成功覆盖时必须立刻 HEAD 校验，不能误报 500 后等待下一请求恢复。
+        if (!r2ObjectMatchesSession(object, session)) {
+          object = await r2Bucket.head(session.objectKey);
+        }
       } catch (error) {
         object = await r2Bucket.head(session.objectKey);
         if (!r2ObjectMatchesSession(object, session)) throw error;

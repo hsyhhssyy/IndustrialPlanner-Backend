@@ -363,6 +363,35 @@ describe("RQ-007 最新态 D1/R2 与下载链路", () => {
     );
     const prepare = await prepareAndUpload(mutation, bytes);
     const repository = createRepository(db);
+    const r2WithoutCompleteMetadata = new Proxy(r2, {
+      get(target, property) {
+        if (property === "resumeMultipartUpload") {
+          return (key: string, uploadId: string) => {
+            const multipart = target.resumeMultipartUpload(key, uploadId);
+            return new Proxy(multipart, {
+              get(multipartTarget, multipartProperty) {
+                if (multipartProperty === "complete") {
+                  return async (parts: R2UploadedPart[]) => {
+                    const completed = await multipartTarget.complete(parts);
+                    return new Proxy(completed, {
+                      get(completedTarget, completedProperty) {
+                        if (completedProperty === "customMetadata") return undefined;
+                        const value = Reflect.get(completedTarget, completedProperty, completedTarget);
+                        return typeof value === "function" ? value.bind(completedTarget) : value;
+                      },
+                    });
+                  };
+                }
+                const value = Reflect.get(multipartTarget, multipartProperty, multipartTarget);
+                return typeof value === "function" ? value.bind(multipartTarget) : value;
+              },
+            });
+          };
+        }
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
     const faultRepository: SyncRepository = {
       ...repository,
       finalizeTieredCommit: async () => {
@@ -377,7 +406,7 @@ describe("RQ-007 最新态 D1/R2 与下载链路", () => {
       [mutation],
       {
         repo: faultRepository,
-        r2Bucket: r2,
+        r2Bucket: r2WithoutCompleteMetadata,
         commitTokenSecret: SECRET,
         now: Date.now(),
         presentTime: new Date().toISOString(),
