@@ -40,6 +40,7 @@ COPY pnpm-workspace.yaml pnpm-lock.yaml package.json tsconfig.base.json ./
 RUN npm install -g wrangler
 
 # .dev.vars 注入环境变量（LOCAL_DEV_HOST 运行时 -e 覆盖）
+# AI-CORRECTION 2026-08-09: 当前能力 URL 使用 PUBLIC_BASE_URL；通过 --var 显式传入，避免 Ingress 后生成 http URL。
 COPY packages/sync/.dev.vars.docker packages/sync/.dev.vars
 
 EXPOSE 8080
@@ -48,4 +49,5 @@ CMD ["bash", "-c", "\
   cd packages/sync && \
   wrangler d1 migrations apply sync-db --local --persist-to /data && \
   exec wrangler dev --ip 0.0.0.0 --port 8080 --persist-to /data \
+    --var "PUBLIC_BASE_URL:${PUBLIC_BASE_URL}" \
   "]

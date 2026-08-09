@@ -26,6 +26,9 @@ spec:
           env:
             - name: LOCAL_DEV_HOST
               value: "https://${DOMAIN}"
+            # AI-CORRECTION 2026-08-09: RQ-007 票据 URL 读取 PUBLIC_BASE_URL；保留旧变量仅供历史路径审计。
+            - name: PUBLIC_BASE_URL
+              value: "https://${DOMAIN}"
             - name: COMMIT_TOKEN_SECRET
               value: "dev-secret-key-32-bytes-long!!"
           volumeMounts:
