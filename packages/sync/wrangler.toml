@@ -17,14 +17,14 @@ bucket_name = "industrial-sync-blobs"
 
 # 环境变量
 [vars]
-PROTOCOL_VERSION = "cf-sync-v1"
+PROTOCOL_VERSION = "cf-sync-v2"
 MAX_MUTATIONS_PER_BATCH = "32"
 MAX_METADATA_SIZE = "262144"
 R2_ENTER_THRESHOLD_BYTES = "614400"
 D1_RETURN_THRESHOLD_BYTES = "552960"
 MAX_BATCH_D1_BLOB_BYTES = "8388608"
 MAX_R2_BLOB_BYTES = "26214400"
-RETENTION_HEAD_WINDOW = "1000"
+UPLOAD_TTL_SECONDS = "900"
 # LOCAL_DEV_HOST 仅通过 .dev.vars（本地）或 K8s 环境变量（Beta）注入
 # 不在此处设默认值，避免 wrangler dev 覆盖环境变量
 
@@ -50,14 +50,20 @@ binding = "BLOB_STORE"
 bucket_name = "industrial-sync-blobs-beta"
 
 [env.beta.vars]
-PROTOCOL_VERSION = "cf-sync-v1"
+PROTOCOL_VERSION = "cf-sync-v2"
 MAX_MUTATIONS_PER_BATCH = "32"
 MAX_METADATA_SIZE = "262144"
 R2_ENTER_THRESHOLD_BYTES = "614400"
 D1_RETURN_THRESHOLD_BYTES = "552960"
 MAX_BATCH_D1_BLOB_BYTES = "8388608"
 MAX_R2_BLOB_BYTES = "26214400"
-RETENTION_HEAD_WINDOW = "1000"
+UPLOAD_TTL_SECONDS = "900"
+
+[env.beta.triggers]
+crons = ["*/5 * * * *"]
+
+[triggers]
+crons = ["*/5 * * * *"]
 
 [dev]
 port = 8080

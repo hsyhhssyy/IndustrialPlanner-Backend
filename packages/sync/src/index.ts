@@ -2,14 +2,16 @@
 //
 // 能力范围：cf-sync-v1 协议上传路径（prepare + R2 预签名 PUT + commit）
 // Phase 1：无鉴权，自管资产 meta
+// AI-CORRECTION 2026-08-09: active 协议已升级为 cf-sync-v2；prepare 获取 space 级独占租约，
+// commit 原子推进 space revision，full-only 模式同时推进 epoch。
 
-import { createApp, type SyncEnv } from "./http";
+import { createSpaceSyncApp, runScheduledCleanup, type SpaceSyncEnv } from "./space_http";
 import { withCors, ANONYMOUS_CORS_HEADERS } from "@industrial/shared";
 
-const app = createApp();
+const app = createSpaceSyncApp();
 
 export default {
-  fetch: async (request: Request, env: SyncEnv) => {
+  fetch: async (request: Request, env: SpaceSyncEnv) => {
     try {
       const response = await app.fetch(request, env);
       return withCors(response, ANONYMOUS_CORS_HEADERS);
@@ -21,5 +23,8 @@ export default {
       );
       return withCors(errorResponse, ANONYMOUS_CORS_HEADERS);
     }
+  },
+  scheduled: async (_controller: ScheduledController, env: SpaceSyncEnv, ctx: ExecutionContext) => {
+    ctx.waitUntil(runScheduledCleanup(env));
   },
 };
