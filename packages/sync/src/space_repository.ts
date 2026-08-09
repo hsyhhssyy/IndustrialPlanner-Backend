@@ -3,6 +3,7 @@
 import type {
   AssetRow,
   CommitResult,
+  DeleteItemRow,
   SpaceRow,
   UploadBatchRow,
   UploadItemRow,
@@ -11,12 +12,14 @@ import type {
 export interface ReserveUploadInput {
   batch: UploadBatchRow;
   items: UploadItemRow[];
+  deletions: DeleteItemRow[];
   lockedAt: string;
 }
 
 export interface FinalizeUploadInput {
   batch: UploadBatchRow;
   items: UploadItemRow[];
+  deletions: DeleteItemRow[];
   r2Versions: Record<string, string>;
   result: CommitResult;
   committedAt: string;
@@ -32,6 +35,7 @@ export interface SpaceRepository {
   getPendingBatch(spaceId: string): Promise<UploadBatchRow | null>;
   listRecoverableBatches(now: string, limit: number): Promise<UploadBatchRow[]>;
   listItems(uploadId: string): Promise<UploadItemRow[]>;
+  listDeleteItems(uploadId: string): Promise<DeleteItemRow[]>;
   getItem(uploadId: string, assetType: string, assetId: string): Promise<UploadItemRow | null>;
   reserveUpload(input: ReserveUploadInput): Promise<void>;
   claimItem(uploadId: string, assetType: string, assetId: string, now: string, leaseExpiresAt: string): Promise<boolean>;
@@ -39,6 +43,7 @@ export interface SpaceRepository {
   setMultipartId(uploadId: string, assetType: string, assetId: string, multipartUploadId: string, now: string): Promise<void>;
   markD1ItemReady(uploadId: string, assetType: string, assetId: string, content: ArrayBuffer, now: string): Promise<boolean>;
   markR2ItemReady(uploadId: string, assetType: string, assetId: string, etag: string, now: string): Promise<boolean>;
+  markDeleteItemDeleted(uploadId: string, assetType: string, assetId: string, now: string): Promise<boolean>;
   beginCommit(uploadId: string, now: string): Promise<void>;
   finalizeCommit(input: FinalizeUploadInput): Promise<void>;
   beginCancel(uploadId: string, now: string): Promise<boolean>;
@@ -52,6 +57,13 @@ function binary(value: unknown): ArrayBuffer | null {
   if (value instanceof ArrayBuffer) return value;
   if (ArrayBuffer.isView(value)) {
     return value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength) as ArrayBuffer;
+  }
+  // AI-CORRECTION 2026-08-09: 正式 Cloudflare D1 会把 BLOB 查询结果表示为 number[]；
+  // 必须在 repository 边界统一成 ArrayBuffer，否则提交阶段会把已上传的 D1 payload 误判为空。
+  if (Array.isArray(value) && value.every(
+    (byte) => Number.isInteger(byte) && byte >= 0 && byte <= 255,
+  )) {
+    return Uint8Array.from(value).buffer;
   }
   return null;
 }
@@ -138,6 +150,20 @@ function mapItem(row: Record<string, unknown>): UploadItemRow {
     d1Content: binary(row.d1_content),
     state: row.state as UploadItemRow["state"],
     leaseExpiresAt: (row.lease_expires_at as string | null) ?? null,
+    createdAt: row.created_at as string,
+    updatedAt: row.updated_at as string,
+  };
+}
+
+function mapDeleteItem(row: Record<string, unknown>): DeleteItemRow {
+  return {
+    uploadId: row.upload_id as string,
+    spaceId: row.space_id as string,
+    clientMutationId: row.client_mutation_id as string,
+    assetType: row.asset_type as string,
+    assetId: row.asset_id as string,
+    objectKey: row.object_key as string,
+    state: row.state as DeleteItemRow["state"],
     createdAt: row.created_at as string,
     updatedAt: row.updated_at as string,
   };
@@ -286,6 +312,13 @@ export function createSpaceRepository(db: D1Database): SpaceRepository {
       return (result.results ?? []).map(mapItem);
     },
 
+    async listDeleteItems(uploadId) {
+      const result = await db.prepare(
+        "SELECT * FROM sync_delete_items WHERE upload_id=?1 ORDER BY asset_type, asset_id",
+      ).bind(uploadId).all<Record<string, unknown>>();
+      return (result.results ?? []).map(mapDeleteItem);
+    },
+
     async getItem(uploadId, assetType, assetId) {
       const row = await db.prepare(
         `SELECT * FROM sync_upload_items
@@ -294,7 +327,7 @@ export function createSpaceRepository(db: D1Database): SpaceRepository {
       return row ? mapItem(row) : null;
     },
 
-    async reserveUpload({ batch, items, lockedAt }) {
+    async reserveUpload({ batch, items, deletions, lockedAt }) {
       const statements: D1PreparedStatement[] = [
         db.prepare(
           `INSERT INTO sync_operation_guards(operation_id, guard_key, ok)
@@ -351,6 +384,22 @@ export function createSpaceRepository(db: D1Database): SpaceRepository {
           item.objectKey,
           item.state,
           item.createdAt,
+        ));
+      }
+      for (const deletion of deletions) {
+        statements.push(db.prepare(
+          `INSERT INTO sync_delete_items
+             (upload_id,space_id,client_mutation_id,asset_type,asset_id,object_key,
+              state,created_at,updated_at)
+           VALUES (?1,?2,?3,?4,?5,?6,'issued',?7,?7)`,
+        ).bind(
+          deletion.uploadId,
+          deletion.spaceId,
+          deletion.clientMutationId,
+          deletion.assetType,
+          deletion.assetId,
+          deletion.objectKey,
+          deletion.createdAt,
         ));
       }
       statements.push(
@@ -412,6 +461,16 @@ export function createSpaceRepository(db: D1Database): SpaceRepository {
       return (result.meta?.changes ?? 0) === 1;
     },
 
+    async markDeleteItemDeleted(uploadId, assetType, assetId, now) {
+      const result = await db.prepare(
+        `UPDATE sync_delete_items SET state='deleted',updated_at=?4
+         WHERE upload_id=?1 AND asset_type=?2 AND asset_id=?3 AND state='reserved'
+           AND EXISTS(SELECT 1 FROM sync_upload_batches b
+                      WHERE b.upload_id=?1 AND b.state='committing')`,
+      ).bind(uploadId, assetType, assetId, now).run();
+      return (result.meta?.changes ?? 0) === 1;
+    },
+
     async beginCommit(uploadId, now) {
       const guardId = `${uploadId}:commit`;
       await db.batch([
@@ -432,11 +491,14 @@ export function createSpaceRepository(db: D1Database): SpaceRepository {
         db.prepare(
           "UPDATE sync_upload_items SET state='reserved',updated_at=?2 WHERE upload_id=?1 AND state='ready'",
         ).bind(uploadId, now),
+        db.prepare(
+          "UPDATE sync_delete_items SET state='reserved',updated_at=?2 WHERE upload_id=?1 AND state='issued'",
+        ).bind(uploadId, now),
         db.prepare("DELETE FROM sync_operation_guards WHERE operation_id=?1").bind(guardId),
       ]);
     },
 
-    async finalizeCommit({ batch, items, r2Versions, result, committedAt }) {
+    async finalizeCommit({ batch, items, deletions, r2Versions, result, committedAt }) {
       const guardId = `${batch.uploadId}:finalize`;
       const statements: D1PreparedStatement[] = [
         db.prepare(
@@ -457,6 +519,11 @@ export function createSpaceRepository(db: D1Database): SpaceRepository {
           committedAt,
         ));
       }
+      for (const deletion of deletions) {
+        statements.push(db.prepare(
+          "DELETE FROM sync_assets WHERE space_id=?1 AND asset_type=?2 AND asset_id=?3",
+        ).bind(batch.spaceId, deletion.assetType, deletion.assetId));
+      }
       statements.push(
         db.prepare(
           `UPDATE sync_spaces
@@ -474,6 +541,10 @@ export function createSpaceRepository(db: D1Database): SpaceRepository {
           `UPDATE sync_upload_items
            SET state='committed',d1_content=NULL,lease_expires_at=NULL,updated_at=?2
            WHERE upload_id=?1 AND state='reserved'`,
+        ).bind(batch.uploadId, committedAt),
+        db.prepare(
+          `UPDATE sync_delete_items SET state='committed',updated_at=?2
+           WHERE upload_id=?1 AND state='deleted'`,
         ).bind(batch.uploadId, committedAt),
         db.prepare(
           `UPDATE sync_upload_batches
@@ -507,6 +578,10 @@ export function createSpaceRepository(db: D1Database): SpaceRepository {
         db.prepare(
           `UPDATE sync_upload_items
            SET state='cancelled',d1_content=NULL,lease_expires_at=NULL,updated_at=?2
+           WHERE upload_id=?1 AND state NOT IN ('committed','cancelled')`,
+        ).bind(uploadId, now),
+        db.prepare(
+          `UPDATE sync_delete_items SET state='cancelled',updated_at=?2
            WHERE upload_id=?1 AND state NOT IN ('committed','cancelled')`,
         ).bind(uploadId, now),
         db.prepare(

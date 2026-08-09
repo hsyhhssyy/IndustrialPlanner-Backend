@@ -5,6 +5,8 @@ import path from "node:path";
 import worker from "./index";
 import type { SpaceSyncEnv } from "./space_http";
 import { runScheduledCleanup } from "./space_http";
+import { createSpaceRepository, type SpaceRepository } from "./space_repository";
+import { recoverBatch } from "./space_service";
 import { sha256Hex } from "./space_token";
 
 const SECRET = "space-revision-test-secret-with-32-bytes";
@@ -12,15 +14,17 @@ let proxy: PlatformProxy<{ DB: D1Database; BLOB_STORE: R2Bucket }>;
 let env: SpaceSyncEnv;
 
 async function applySchema(db: D1Database): Promise<void> {
-  const sql = fs.readFileSync(
-    path.resolve(__dirname, "..", "migrations", "0001_create_sync_tables.sql"),
-    "utf8",
-  );
-  const executable = sql.split("\n")
-    .filter((line) => !line.trimStart().startsWith("--"))
-    .join("\n");
-  for (const statement of executable.split(";").map((value) => value.trim()).filter(Boolean)) {
-    await db.prepare(statement).run();
+  // AI-CORRECTION 2026-08-09: 集成测试必须应用完整 active migration 链，
+  // 否则新增 schema 在 Miniflare 中不会被真实协议路径覆盖。
+  const migrationDirectory = path.resolve(__dirname, "..", "migrations");
+  for (const filename of fs.readdirSync(migrationDirectory).filter((name) => name.endsWith(".sql")).sort()) {
+    const sql = fs.readFileSync(path.join(migrationDirectory, filename), "utf8");
+    const executable = sql.split("\n")
+      .filter((line) => !line.trimStart().startsWith("--"))
+      .join("\n");
+    for (const statement of executable.split(";").map((value) => value.trim()).filter(Boolean)) {
+      await db.prepare(statement).run();
+    }
   }
 }
 
@@ -67,6 +71,7 @@ async function prepare(
   baseRevision: number,
   clientBatchId: string,
   objects: Awaited<ReturnType<typeof objectFor>>[],
+  deletions: Array<{ clientMutationId: string; assetType: string; assetId: string }> = [],
 ): Promise<Response> {
   return jsonRequest(`/v1/sync/spaces/${spaceId}/mutations`, {
     protocol: "cf-sync-v2",
@@ -74,6 +79,7 @@ async function prepare(
     baseRevision,
     clientBatchId,
     objects,
+    deletions,
   });
 }
 
@@ -127,6 +133,51 @@ afterAll(async () => {
 });
 
 describe("cf-sync-v2 space revision 上传事务", () => {
+  it("兼容正式 D1 将 BLOB 返回为 number[] 的读取形态", async () => {
+    const productionLikeRow = {
+      space_id: "production-d1-shape",
+      asset_type: "blueprint",
+      asset_id: "blob-array",
+      epoch: 1,
+      last_modified_revision: 1,
+      content_hash: "hash",
+      byte_size: 4,
+      encoding: "identity",
+      metadata: "{}",
+      schema_version: 1,
+      writer_app_version: "test",
+      writer_build_id: "test",
+      storage_mode: "full",
+      active_backend: "d1",
+      d1_content: [0, 127, 128, 255],
+      d1_blob_hash: "hash",
+      d1_byte_size: 4,
+      d1_encoding: "identity",
+      r2_key: "fixed-key",
+      r2_present: 0,
+      r2_blob_hash: null,
+      r2_byte_size: null,
+      r2_encoding: null,
+      r2_version: null,
+      committed_at: "2026-08-09T00:00:00.000Z",
+    };
+    const statement = {
+      bind: () => statement,
+      first: async () => productionLikeRow,
+    };
+    const repository = createSpaceRepository({
+      prepare: () => statement,
+    } as unknown as D1Database);
+
+    const asset = await repository.getAsset(
+      productionLikeRow.space_id,
+      productionLikeRow.asset_type,
+      productionLikeRow.asset_id,
+    );
+    expect(Array.from(new Uint8Array(asset?.d1Content ?? new ArrayBuffer(0))))
+      .toEqual([0, 127, 128, 255]);
+  });
+
   it("能力声明 revision 协议和 15 分钟租约", async () => {
     const response = await request("/v1/sync/capabilities");
     expect(response.status).toBe(200);
@@ -283,5 +334,142 @@ describe("cf-sync-v2 space revision 上传事务", () => {
     expect(rows.results).toHaveLength(1);
     expect((await env.BLOB_STORE.list({ prefix: `sync/v3/spaces/${encodeURIComponent(spaceId)}/` })).objects)
       .toHaveLength(1);
+  });
+
+  it("资产切回 D1 后删除仍清除固定 R2 对象，并在同一 commit 发布新 revision", async () => {
+    const spaceId = `delete-${crypto.randomUUID()}`;
+    await createSpace(spaceId);
+    const largeBytes = new Uint8Array(614_400).fill(0x31);
+    const largeObject = await objectFor(largeBytes, "blueprint", "deleted", "m-large");
+    const large = await (await prepare(spaceId, 0, "large", [largeObject])).json() as Record<string, any>;
+    expect((await uploadAll(large, new Map([["blueprint/deleted", largeBytes]])))[0]?.status).toBe(200);
+    expect((await commit(spaceId, large)).status).toBe(200);
+
+    const smallBytes = new TextEncoder().encode("active-d1-but-r2-retained");
+    const smallObject = await objectFor(smallBytes, "blueprint", "deleted", "m-small");
+    const small = await (await prepare(spaceId, 1, "small", [smallObject])).json() as Record<string, any>;
+    expect(small.uploads[0]).toMatchObject({ backend: "d1" });
+    expect((await uploadAll(small, new Map([["blueprint/deleted", smallBytes]])))[0]?.status).toBe(200);
+    expect((await commit(spaceId, small)).status).toBe(200);
+
+    const row = await env.DB.prepare(
+      "SELECT active_backend,r2_present,r2_key FROM sync_assets WHERE space_id=?1 AND asset_type='blueprint' AND asset_id='deleted'",
+    ).bind(spaceId).first<{ active_backend: string; r2_present: number; r2_key: string }>();
+    expect(row).toMatchObject({ active_backend: "d1", r2_present: 1 });
+    expect(await env.BLOB_STORE.head(row!.r2_key)).not.toBeNull();
+
+    const deletion = await prepare(spaceId, 2, "delete", [], [{
+      clientMutationId: "m-delete",
+      assetType: "blueprint",
+      assetId: "deleted",
+    }]);
+    expect(deletion.status).toBe(200);
+    const prepared = await deletion.json() as Record<string, any>;
+    expect(prepared.uploads).toEqual([]);
+    const deleted = await (await commit(spaceId, prepared)).json() as Record<string, any>;
+    expect(deleted).toMatchObject({
+      status: "committed",
+      revision: 3,
+      epoch: 3,
+      assets: [],
+      deletedAssets: [{ assetType: "blueprint", assetId: "deleted" }],
+    });
+
+    expect(await env.BLOB_STORE.head(row!.r2_key)).toBeNull();
+    expect(await env.DB.prepare(
+      "SELECT 1 AS present FROM sync_assets WHERE space_id=?1 AND asset_type='blueprint' AND asset_id='deleted'",
+    ).bind(spaceId).first()).toBeNull();
+    expect(await (await request(`/v1/sync/spaces/${spaceId}/plan`)).json()).toMatchObject({
+      revision: 3,
+      epoch: 3,
+      assets: [],
+    });
+    expect(await (await commit(spaceId, prepared)).json()).toMatchObject({
+      status: "already-committed",
+      revision: 3,
+      deletedAssets: [{ assetType: "blueprint", assetId: "deleted" }],
+    });
+  });
+
+  it("R2 删除后 D1 finalize 失败时保持 space 锁并由 recovery 向前完成", async () => {
+    const spaceId = `delete-recovery-${crypto.randomUUID()}`;
+    await createSpace(spaceId);
+    const bytes = new Uint8Array(614_400).fill(0x52);
+    const object = await objectFor(bytes, "blueprint", "recover-delete", "m-create");
+    const created = await (await prepare(spaceId, 0, "create", [object])).json() as Record<string, any>;
+    expect((await uploadAll(created, new Map([["blueprint/recover-delete", bytes]])))[0]?.status).toBe(200);
+    expect((await commit(spaceId, created)).status).toBe(200);
+
+    const prepared = await (await prepare(spaceId, 1, "delete-recovery", [], [{
+      clientMutationId: "m-delete-recovery",
+      assetType: "blueprint",
+      assetId: "recover-delete",
+    }])).json() as Record<string, any>;
+    const repository = createSpaceRepository(env.DB);
+    await repository.beginCommit(prepared.uploadId, new Date().toISOString());
+    const committing = await repository.getBatch(prepared.uploadId);
+    const asset = await repository.getAsset(spaceId, "blueprint", "recover-delete");
+    expect(committing?.state).toBe("committing");
+    expect(asset).not.toBeNull();
+
+    const failingRepository: SpaceRepository = {
+      ...repository,
+      finalizeCommit: async () => {
+        throw new Error("injected D1 finalize failure");
+      },
+    };
+    await expect(recoverBatch(committing!, {
+      repo: failingRepository,
+      r2Bucket: env.BLOB_STORE,
+      tokenSecret: SECRET,
+      now: Date.now(),
+    })).rejects.toThrow("injected D1 finalize failure");
+    expect(await env.BLOB_STORE.head(asset!.r2Key)).toBeNull();
+    expect((await repository.getSpace(spaceId))?.pendingUploadId).toBe(prepared.uploadId);
+    expect((await repository.listDeleteItems(prepared.uploadId))[0]?.state).toBe("deleted");
+
+    const recovered = await recoverBatch((await repository.getBatch(prepared.uploadId))!, {
+      repo: repository,
+      r2Bucket: env.BLOB_STORE,
+      tokenSecret: SECRET,
+      now: Date.now(),
+    });
+    expect(recovered).toMatchObject({ revision: 2, epoch: 2 });
+    expect(await (await request(`/v1/sync/spaces/${spaceId}/plan`)).json()).toMatchObject({
+      revision: 2,
+      epoch: 2,
+      assets: [],
+    });
+  });
+
+  it("prepare 拒绝空变更集、重复资产和不存在的删除目标", async () => {
+    const spaceId = `delete-validation-${crypto.randomUUID()}`;
+    await createSpace(spaceId);
+    const empty = await prepare(spaceId, 0, "empty", []);
+    expect(empty.status).toBe(400);
+    expect(await empty.json()).toMatchObject({ error: "bad_request" });
+
+    const bytes = new TextEncoder().encode("duplicate-target");
+    const object = await objectFor(bytes, "blueprint", "same", "m-write");
+    const duplicate = await prepare(spaceId, 0, "duplicate", [object], [{
+      clientMutationId: "m-delete",
+      assetType: "blueprint",
+      assetId: "same",
+    }]);
+    expect(duplicate.status).toBe(400);
+    expect(await duplicate.json()).toMatchObject({ error: "bad_request" });
+
+    const missing = await prepare(spaceId, 0, "missing", [], [{
+      clientMutationId: "m-missing",
+      assetType: "blueprint",
+      assetId: "missing",
+    }]);
+    expect(missing.status).toBe(404);
+    expect(await missing.json()).toMatchObject({ error: "asset_not_found" });
+    expect(await (await request(`/v1/sync/spaces/${spaceId}/plan`)).json()).toMatchObject({
+      revision: 0,
+      epoch: 0,
+      assets: [],
+    });
   });
 });

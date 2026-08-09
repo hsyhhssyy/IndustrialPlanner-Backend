@@ -80,6 +80,21 @@ export interface PrepareObject {
   writerBuildId: string;
 }
 
+export interface PrepareDeletion {
+  clientMutationId: string;
+  assetType: string;
+  assetId: string;
+}
+
+export interface DeleteItemRow extends PrepareDeletion {
+  uploadId: string;
+  spaceId: string;
+  objectKey: string;
+  state: "issued" | "reserved" | "deleted" | "committed" | "cancelled";
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface UploadBatchRow {
   uploadId: string;
   spaceId: string;
@@ -142,6 +157,10 @@ export interface CommitResult {
     contentHash: string;
     lastModifiedRevision: number;
   }>;
+  deletedAssets: Array<{
+    assetType: string;
+    assetId: string;
+  }>;
   serverTime: string;
 }
 
@@ -196,8 +215,10 @@ export function validatePrepareObjects(
   value: unknown,
   maxBatchSize: number,
 ): { ok: true; objects: PrepareObject[] } | { ok: false; message: string } {
-  if (!Array.isArray(value) || value.length === 0) {
-    return { ok: false, message: "objects 必须是非空数组" };
+  // AI-CORRECTION 2026-08-09: cf-sync-v2 批次允许只包含资产删除；非空约束改由
+  // validatePrepareBatch 对 objects + deletions 的完整 mutation 集合统一校验。
+  if (!Array.isArray(value)) {
+    return { ok: false, message: "objects 必须是数组" };
   }
   if (value.length > maxBatchSize) {
     return { ok: false, message: `objects 数量超过上限 ${maxBatchSize}` };
@@ -250,4 +271,52 @@ export function validatePrepareObjects(
     seenMutations.add(object.clientMutationId as string);
   }
   return { ok: true, objects: value as PrepareObject[] };
+}
+
+export function validatePrepareBatch(
+  objectValue: unknown,
+  deletionValue: unknown,
+  maxBatchSize: number,
+):
+  | { ok: true; objects: PrepareObject[]; deletions: PrepareDeletion[] }
+  | { ok: false; message: string } {
+  const objects = validatePrepareObjects(objectValue, maxBatchSize);
+  if (!objects.ok) return objects;
+  if (!Array.isArray(deletionValue)) {
+    return { ok: false, message: "deletions 必须是数组" };
+  }
+  if (objects.objects.length + deletionValue.length === 0) {
+    return { ok: false, message: "objects 和 deletions 不能同时为空" };
+  }
+  if (objects.objects.length + deletionValue.length > maxBatchSize) {
+    return { ok: false, message: `mutation 数量超过上限 ${maxBatchSize}` };
+  }
+
+  const assetKeys = new Set(objects.objects.map(
+    (object) => `${object.assetType}\u0000${object.assetId}`,
+  ));
+  const mutationIds = new Set(objects.objects.map((object) => object.clientMutationId));
+  for (const raw of deletionValue) {
+    if (!raw || typeof raw !== "object") {
+      return { ok: false, message: "deletions 包含非法对象" };
+    }
+    const deletion = raw as Record<string, unknown>;
+    if (
+      typeof deletion.clientMutationId !== "string" || deletion.clientMutationId === "" ||
+      typeof deletion.assetType !== "string" || deletion.assetType === "" ||
+      typeof deletion.assetId !== "string" || deletion.assetId === ""
+    ) {
+      return { ok: false, message: "deletion 缺少必填字符串字段" };
+    }
+    const assetKey = `${deletion.assetType}\u0000${deletion.assetId}`;
+    if (assetKeys.has(assetKey)) {
+      return { ok: false, message: "同一批次不能重复变更资产" };
+    }
+    if (mutationIds.has(deletion.clientMutationId)) {
+      return { ok: false, message: "同一批次不能重复 clientMutationId" };
+    }
+    assetKeys.add(assetKey);
+    mutationIds.add(deletion.clientMutationId);
+  }
+  return { ok: true, objects: objects.objects, deletions: deletionValue as PrepareDeletion[] };
 }

@@ -11,7 +11,7 @@ import {
   DEFAULT_R2_ENTER_THRESHOLD_BYTES,
   DEFAULT_UPLOAD_TTL_SECONDS,
   SPACE_PROTOCOL_VERSION,
-  validatePrepareObjects,
+  validatePrepareBatch,
   type StorageConfig,
 } from "./space_model";
 import { createSpaceRepository } from "./space_repository";
@@ -179,8 +179,9 @@ export function createSpaceSyncApp(): Hono<{ Bindings: SpaceSyncEnv }> {
       if (!Number.isSafeInteger(body.baseRevision) || (body.baseRevision as number) < 0) {
         throw new SpaceProtocolError(400, "bad_request", "baseRevision 必须是非负整数");
       }
-      const validated = validatePrepareObjects(
-        body.objects,
+      const validated = validatePrepareBatch(
+        body.objects ?? [],
+        body.deletions ?? [],
         positiveInt(c.env.MAX_MUTATIONS_PER_BATCH, DEFAULT_MAX_MUTATIONS_PER_BATCH),
       );
       if (!validated.ok) throw new SpaceProtocolError(400, "bad_request", validated.message);
@@ -196,6 +197,7 @@ export function createSpaceSyncApp(): Hono<{ Bindings: SpaceSyncEnv }> {
         body.baseRevision as number,
         typeof body.clientBatchId === "string" ? body.clientBatchId : "",
         validated.objects,
+        validated.deletions,
         {
           ...baseDeps(c.env),
           publicBaseUrl: publicBaseUrl(c.req.raw, c.env),

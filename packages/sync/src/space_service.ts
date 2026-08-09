@@ -3,7 +3,9 @@
 import type {
   AssetRow,
   CommitResult,
+  DeleteItemRow,
   PlanResponse,
+  PrepareDeletion,
   PrepareObject,
   PrepareResponse,
   SpaceRow,
@@ -64,8 +66,23 @@ function canonicalObjects(objects: PrepareObject[]): PrepareObject[] {
   );
 }
 
-async function descriptorHash(objects: PrepareObject[]): Promise<string> {
-  return sha256Hex(JSON.stringify(canonicalObjects(objects)));
+function canonicalDeletions(deletions: PrepareDeletion[]): PrepareDeletion[] {
+  return [...deletions].sort((left, right) =>
+    left.assetType.localeCompare(right.assetType) || left.assetId.localeCompare(right.assetId)
+  );
+}
+
+async function descriptorHash(
+  objects: PrepareObject[],
+  deletions: PrepareDeletion[],
+): Promise<string> {
+  // AI-CORRECTION 2026-08-09: 不含删除的既有 v2 批次保留原 descriptor hash，
+  // 新删除集合进入同一个幂等描述符，避免跨部署重试漂移。
+  if (deletions.length === 0) return sha256Hex(JSON.stringify(canonicalObjects(objects)));
+  return sha256Hex(JSON.stringify({
+    objects: canonicalObjects(objects),
+    deletions: canonicalDeletions(deletions),
+  }));
 }
 
 function batchTokenPayload(batch: UploadBatchRow): BatchTokenPayload {
@@ -218,7 +235,12 @@ async function completeR2Items(
   return versions;
 }
 
-function resultForBatch(batch: UploadBatchRow, items: UploadItemRow[], now: string): CommitResult {
+function resultForBatch(
+  batch: UploadBatchRow,
+  items: UploadItemRow[],
+  deletions: DeleteItemRow[],
+  now: string,
+): CommitResult {
   return {
     status: "committed",
     uploadId: batch.uploadId,
@@ -230,8 +252,33 @@ function resultForBatch(batch: UploadBatchRow, items: UploadItemRow[], now: stri
       contentHash: item.blobHash,
       lastModifiedRevision: batch.targetRevision,
     })),
+    deletedAssets: deletions.map((deletion) => ({
+      assetType: deletion.assetType,
+      assetId: deletion.assetId,
+    })),
     serverTime: now,
   };
+}
+
+async function deleteR2Items(
+  deletions: DeleteItemRow[],
+  deps: BaseDeps,
+): Promise<void> {
+  for (const deletion of deletions) {
+    if (deletion.state === "deleted") continue;
+    if (deletion.state !== "reserved") {
+      throw new Error(`删除项 ${deletion.assetType}/${deletion.assetId} 未达到 reserved 状态`);
+    }
+    await deps.r2Bucket.delete(deletion.objectKey);
+    if (!await deps.repo.markDeleteItemDeleted(
+      deletion.uploadId,
+      deletion.assetType,
+      deletion.assetId,
+      iso(deps.now),
+    )) {
+      throw new Error(`固定 R2 对象 ${deletion.objectKey} 删除后状态未能推进`);
+    }
+  }
 }
 
 async function cancelInternal(batch: UploadBatchRow, deps: BaseDeps): Promise<boolean> {
@@ -267,11 +314,20 @@ export async function recoverBatch(batch: UploadBatchRow, deps: BaseDeps): Promi
   if (batch.state !== "committing") return null;
 
   const items = await deps.repo.listItems(batch.uploadId);
+  const deletions = await deps.repo.listDeleteItems(batch.uploadId);
   try {
     const versions = await completeR2Items(items, deps.r2Bucket);
+    await deleteR2Items(deletions, deps);
     const committedAt = iso(deps.now);
-    const result = resultForBatch(batch, items, committedAt);
-    await deps.repo.finalizeCommit({ batch, items, r2Versions: versions, result, committedAt });
+    const result = resultForBatch(batch, items, deletions, committedAt);
+    await deps.repo.finalizeCommit({
+      batch,
+      items,
+      deletions,
+      r2Versions: versions,
+      result,
+      committedAt,
+    });
     return result;
   } catch (error) {
     await deps.repo.setBatchError(
@@ -293,12 +349,13 @@ export async function prepareSpaceUpload(
   baseRevision: number,
   clientBatchId: string,
   objects: PrepareObject[],
+  deletions: PrepareDeletion[],
   deps: PrepareDeps,
 ): Promise<PrepareResponse> {
   if (!clientBatchId) {
     throw new SpaceProtocolError(400, "bad_request", "clientBatchId 不能为空");
   }
-  const digest = await descriptorHash(objects);
+  const digest = await descriptorHash(objects, deletions);
   const existing = await deps.repo.getBatchByClientId(spaceId, clientBatchId);
   if (existing) {
     if (existing.baseRevision !== baseRevision || existing.descriptorHash !== digest) {
@@ -388,12 +445,31 @@ export async function prepareSpaceUpload(
       updatedAt: now,
     });
   }
+  const deleteItems: DeleteItemRow[] = [];
+  for (const deletion of canonicalDeletions(deletions)) {
+    const asset = await deps.repo.getAsset(spaceId, deletion.assetType, deletion.assetId);
+    if (!asset) {
+      throw new SpaceProtocolError(404, "asset_not_found", "待删除资产不存在", {
+        assetType: deletion.assetType,
+        assetId: deletion.assetId,
+      });
+    }
+    deleteItems.push({
+      ...deletion,
+      uploadId,
+      spaceId,
+      objectKey: asset.r2Key,
+      state: "issued",
+      createdAt: now,
+      updatedAt: now,
+    });
+  }
   if (d1Bytes > deps.storage.maxBatchD1BlobBytes) {
     throw new SpaceProtocolError(413, "d1_batch_too_large", "批次 D1 暂存总量超过上限");
   }
 
   try {
-    await deps.repo.reserveUpload({ batch, items, lockedAt: now });
+    await deps.repo.reserveUpload({ batch, items, deletions: deleteItems, lockedAt: now });
   } catch (error) {
     if (!isConstraintConflict(error)) throw error;
     const current = await deps.repo.getSpace(spaceId);
