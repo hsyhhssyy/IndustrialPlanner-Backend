@@ -202,6 +202,51 @@ afterAll(async () => {
 });
 
 describe("RQ-007 最新态 D1/R2 与下载链路", () => {
+  it("TLS Ingress 后生成 HTTPS 能力 URL，不产生额外重定向", async () => {
+    const proxySpaceId = `${SPACE_ID}-proxy`;
+    const proxyEnv = { ...env(), PUBLIC_BASE_URL: undefined };
+    try {
+      const createResponse = await worker.fetch(
+        new Request("http://sync.test/v1/sync/spaces", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Forwarded-Proto": "https",
+          },
+          body: JSON.stringify({ spaceId: proxySpaceId, activeEpoch: EPOCH }),
+        }),
+        proxyEnv,
+      );
+      expect(createResponse.status).toBe(201);
+
+      const bytes = new TextEncoder().encode("proxy-d1-payload");
+      const mutation = await mutationFor(bytes, "m-proxy-d1", null, null);
+      const prepareResponse = await worker.fetch(
+        new Request(`http://sync.test/v1/sync/spaces/${proxySpaceId}/mutations`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Forwarded-Proto": "https",
+          },
+          body: JSON.stringify({
+            protocol: "cf-sync-v1",
+            action: "prepare",
+            spaceEpoch: EPOCH,
+            clientBatchId: "batch-proxy-d1",
+            mutations: [mutation],
+          }),
+        }),
+        proxyEnv,
+      );
+      expect(prepareResponse.status).toBe(200);
+      const prepare = await prepareResponse.json() as Record<string, any>;
+      expect(new URL(prepare.uploads[0].url).origin).toBe("https://sync.test");
+    } finally {
+      await db.prepare("DELETE FROM sync_upload_sessions WHERE space_id = ?1").bind(proxySpaceId).run();
+      await db.prepare("DELETE FROM sync_spaces WHERE space_id = ?1").bind(proxySpaceId).run();
+    }
+  });
+
   it("小文件走 D1，下载必须持有当前版本票据", async () => {
     const bytes = new TextEncoder().encode("d1-current-payload");
     const mutation = await mutationFor(bytes, "m-d1-1", null, null);

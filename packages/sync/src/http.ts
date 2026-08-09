@@ -88,7 +88,20 @@ function storageConfig(env: SyncEnv): TieredStorageConfig {
 }
 
 function publicBaseUrl(c: Context<{ Bindings: SyncEnv }>): string {
-  return (c.env.PUBLIC_BASE_URL || new URL(c.req.url).origin).replace(/\/$/, "");
+  const configuredOrigin = c.env.PUBLIC_BASE_URL?.trim();
+  if (configuredOrigin) return configuredOrigin.replace(/\/$/, "");
+
+  const requestUrl = new URL(c.req.url);
+  const forwardedProtocol = c.req.header("x-forwarded-proto")
+    ?.split(",", 1)[0]
+    ?.trim()
+    .toLowerCase();
+  // AI-CORRECTION 2026-08-09: Beta 的 Ingress 在 TLS 终止后以 http 调用 workerd；
+  // 只允许可信代理信号把当前 origin 升级为 https，不接受 forwarded host，避免能力 URL 被 Host 注入。
+  if (requestUrl.protocol === "http:" && forwardedProtocol === "https") {
+    requestUrl.protocol = "https:";
+  }
+  return requestUrl.origin;
 }
 
 function requireCommitTokenSecret(env: SyncEnv): string {
