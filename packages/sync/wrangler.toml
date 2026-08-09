@@ -37,5 +37,27 @@ RETENTION_HEAD_WINDOW = "1000"
 # COMMIT_TOKEN_SECRET 通过 wrangler secret put 设置
 # R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY / R2_ACCOUNT_ID / R2_BUCKET_NAME 通过 wrangler secret put 设置
 
+[env.beta]
+name = "industrial-sync-beta"
+
+[[env.beta.d1_databases]]
+binding = "DB"
+database_name = "sync-db-beta"
+database_id = "a4270dd4-a6f6-45fe-b657-078a70cc6a21"
+
+[[env.beta.r2_buckets]]
+binding = "BLOB_STORE"
+bucket_name = "industrial-sync-blobs-beta"
+
+[env.beta.vars]
+PROTOCOL_VERSION = "cf-sync-v1"
+MAX_MUTATIONS_PER_BATCH = "32"
+MAX_METADATA_SIZE = "262144"
+R2_ENTER_THRESHOLD_BYTES = "614400"
+D1_RETURN_THRESHOLD_BYTES = "552960"
+MAX_BATCH_D1_BLOB_BYTES = "8388608"
+MAX_R2_BLOB_BYTES = "26214400"
+RETENTION_HEAD_WINDOW = "1000"
+
 [dev]
 port = 8080

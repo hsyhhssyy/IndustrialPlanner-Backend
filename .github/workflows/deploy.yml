@@ -13,10 +13,17 @@ on:
         description: '部署到 Cloudflare Workers'
         type: boolean
         default: false
+      cf_environment:
+        description: 'Cloudflare 目标环境'
+        type: choice
+        options:
+          - beta
+          - stable
+        default: beta
       deploy_k8s:
-        description: '部署到 K8s（Docker 构建）'
+        description: '已停用：Beta 已迁移到 Cloudflare'
         type: boolean
-        default: true
+        default: false
 
 permissions:
   contents: read
@@ -32,15 +39,27 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       is_release: ${{ steps.check.outputs.is_release }}
+      cf_environment: ${{ steps.check.outputs.cf_environment }}
     steps:
       - id: check
+        env:
+          REQUESTED_CF_ENVIRONMENT: ${{ inputs.cf_environment || 'beta' }}
         shell: bash
         run: |
+          set -euo pipefail
           ref="${{ github.ref_name }}"
           if [[ "$ref" =~ ^v[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "is_release=true" >> "$GITHUB_OUTPUT"
+            echo "cf_environment=stable" >> "$GITHUB_OUTPUT"
+          elif [[ "$ref" =~ ^v[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+-([Bb]eta|[Dd]ev)[0-9]+$ ]]; then
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+            echo "cf_environment=beta" >> "$GITHUB_OUTPUT"
           else
             echo "is_release=false" >> "$GITHUB_OUTPUT"
+            case "$REQUESTED_CF_ENVIRONMENT" in
+              stable|beta) echo "cf_environment=$REQUESTED_CF_ENVIRONMENT" >> "$GITHUB_OUTPUT" ;;
+              *) echo "Unsupported Cloudflare environment: $REQUESTED_CF_ENVIRONMENT" >&2; exit 1 ;;
+            esac
           fi
 
   # ── Cloudflare Workers 部署（正式版 tag 或手动勾选） ──
@@ -48,9 +67,11 @@ jobs:
     name: CF Workers
     needs: is-release
     if: |
-      (needs.is-release.outputs.is_release == 'true' && github.event_name == 'push')
+      (github.event_name == 'push')
       || (github.event_name == 'workflow_dispatch' && inputs.deploy_cf)
     runs-on: ubuntu-latest
+    env:
+      CF_ENVIRONMENT: ${{ needs.is-release.outputs.cf_environment }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -73,25 +94,76 @@ jobs:
       - name: Test
         run: pnpm test
 
-      - name: Deploy Workers
+      - name: Load CF token from deploy config
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          DEPLOY_CONFIG: ${{ secrets.DEPLOY_CONFIG }}
         shell: bash
         run: |
-          pnpm --filter @industrial/gateway exec -- npx wrangler deploy
-          pnpm --filter @industrial/sync exec -- npx wrangler deploy
-          pnpm --filter @industrial/telemetry exec -- npx wrangler deploy
-          pnpm --filter @industrial/identity exec -- npx wrangler deploy
-          pnpm --filter @industrial/oauth exec -- npx wrangler deploy
-          pnpm --filter @industrial/assets exec -- npx wrangler deploy
+          set -euo pipefail
+          config_file="$RUNNER_TEMP/deploy-config.json"
+          printf '%s' "$DEPLOY_CONFIG" > "$config_file"
+          cf_token="$(jq -r --arg environment "$CF_ENVIRONMENT" '.[$environment].cloudflare_api_token' "$config_file")"
+          if [ -z "$cf_token" ] || [ "$cf_token" = 'null' ]; then
+            echo "Missing or null: $CF_ENVIRONMENT.cloudflare_api_token" >&2
+            exit 1
+          fi
+          if ! jq -e --arg environment "$CF_ENVIRONMENT" '
+            .[$environment].secrets.sync as $sync
+            | ($sync | type == "object")
+              and ($sync.COMMIT_TOKEN_SECRET | type == "string" and length >= 32)
+              and ($sync.R2_ACCESS_KEY_ID | type == "string" and length > 0)
+              and ($sync.R2_SECRET_ACCESS_KEY | type == "string" and length > 0)
+              and ($sync.R2_ACCOUNT_ID | type == "string" and length > 0)
+              and ($sync.R2_BUCKET_NAME | type == "string" and length > 0)
+          ' "$config_file" >/dev/null; then
+            echo "Missing or invalid: $CF_ENVIRONMENT.secrets.sync" >&2
+            exit 1
+          fi
+          echo "::add-mask::$cf_token"
+          echo "CLOUDFLARE_API_TOKEN=$cf_token" >> "$GITHUB_ENV"
+          echo "DEPLOY_CONFIG_FILE=$config_file" >> "$GITHUB_ENV"
+
+      - name: Apply D1 migrations
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$CF_ENVIRONMENT" = 'beta' ]; then
+            pnpm --filter @industrial/sync exec -- npx wrangler d1 migrations apply sync-db-beta --remote --env beta
+            # AI-REMOVED 2026-08-09: telemetry Beta 尚有独立未提交改造，不能绑进 RQ-007 发布。
+            # Original code: pnpm --filter @industrial/telemetry exec -- npx wrangler d1 migrations apply telemetry-db-beta --remote --env beta
+          else
+            pnpm --filter @industrial/sync exec -- npx wrangler d1 migrations apply sync-db --remote
+            pnpm --filter @industrial/telemetry exec -- npx wrangler d1 migrations apply telemetry-db --remote
+          fi
+
+      - name: Deploy Workers
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$CF_ENVIRONMENT" = 'beta' ]; then
+            pnpm --filter @industrial/sync exec -- npx wrangler deploy --env beta
+            jq -c '.beta.secrets.sync' "$DEPLOY_CONFIG_FILE" \
+              | (cd packages/sync && pnpm exec wrangler secret bulk --env beta)
+            # AI-REMOVED 2026-08-09: telemetry Beta 等其业务改造独立验收后再接入。
+            # Original code: pnpm --filter @industrial/telemetry exec -- npx wrangler deploy --env beta
+            pnpm --filter @industrial/gateway exec -- npx wrangler deploy --env beta
+          else
+            pnpm --filter @industrial/sync exec -- npx wrangler deploy
+            jq -c '.stable.secrets.sync' "$DEPLOY_CONFIG_FILE" \
+              | (cd packages/sync && pnpm exec wrangler secret bulk)
+            pnpm --filter @industrial/telemetry exec -- npx wrangler deploy
+            pnpm --filter @industrial/identity exec -- npx wrangler deploy
+            pnpm --filter @industrial/oauth exec -- npx wrangler deploy
+            pnpm --filter @industrial/assets exec -- npx wrangler deploy
+            pnpm --filter @industrial/gateway exec -- npx wrangler deploy
+          fi
 
   # ── K8s 部署（所有 tag：正式版与 CF 并行，Beta/Dev 单独跑） ──
   deploy-k8s:
     name: K8s
     needs: is-release
-    if: |
-      (github.event_name == 'push')
-      || (github.event_name == 'workflow_dispatch' && inputs.deploy_k8s)
+    # AI-CORRECTION 2026-08-09: Beta 已迁移到独立 Cloudflare Workers/D1/R2；旧 K8s job 仅保留审计，不再执行。
+    if: ${{ false }}
     runs-on: ubuntu-latest
     env:
       RELEASE_TAG: ${{ github.ref_name }}

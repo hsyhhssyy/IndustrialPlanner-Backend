@@ -4,9 +4,34 @@
   "username": "your-username",
   "password": "your-password",
   "image_name": "industrial-sync-dev",
+  "stable": {
+    "_comment": "正式环境",
+    "namespace": "your-stable-namespace",
+    "domain": "your-stable-domain.example.com",
+    "cloudflare_api_token": "your-stable-cloudflare-api-token",
+    "secrets": {
+      "sync": {
+        "COMMIT_TOKEN_SECRET": "<secret>",
+        "R2_ACCESS_KEY_ID": "<secret>",
+        "R2_SECRET_ACCESS_KEY": "<secret>",
+        "R2_ACCOUNT_ID": "<secret>",
+        "R2_BUCKET_NAME": "<secret>"
+      }
+    }
+  },
   "beta": {
-    "_comment": "开发服务器复用 beta 配置（前端联调测试用）",
+    "_comment": "测试环境",
     "namespace": "your-namespace",
-    "domain": "your-domain.example.com"
+    "domain": "your-domain.example.com",
+    "cloudflare_api_token": "your-beta-cloudflare-api-token",
+    "secrets": {
+      "sync": {
+        "COMMIT_TOKEN_SECRET": "<secret>",
+        "R2_ACCESS_KEY_ID": "<secret>",
+        "R2_SECRET_ACCESS_KEY": "<secret>",
+        "R2_ACCOUNT_ID": "<secret>",
+        "R2_BUCKET_NAME": "<secret>"
+      }
+    }
   }
 }
