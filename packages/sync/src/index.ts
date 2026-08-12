@@ -1,9 +1,8 @@
-// Sync Worker 入口 — 组合根
+// Sync Worker 入口
 //
-// 能力范围：cf-sync-v1 协议上传路径（prepare + R2 预签名 PUT + commit）
-// Phase 1：无鉴权，自管资产 meta
-// AI-CORRECTION 2026-08-09: active 协议已升级为 cf-sync-v2；prepare 获取 space 级独占租约，
-// commit 原子推进 space revision，full-only 模式同时推进 epoch。
+// 能力范围：cf-sync-v2 协议 space revision 独占上传事务。
+// prepare 原子获取 space 租约，客户端并行 PUT，commit 推进 revision/epoch。
+// 资产删除通过同一 space 批次的 deletions[] 声明，固定 R2 key 幂等删除后 D1 finalize。
 
 import { createSpaceSyncApp, runScheduledCleanup, type SpaceSyncEnv } from "./space_http";
 import { withCors, ANONYMOUS_CORS_HEADERS, errorDebugInfo } from "@industrial/shared";
