@@ -2,8 +2,11 @@
 //
 // 一个 space 同时只允许一个上传批次。revision 表示已提交的完整空间版本；
 // epoch 表示 full base / patch chain 的世代。当前只实现 full，因此每次提交两者都递增。
+// AI-CORRECTION 2026-08-12: revision 改为 prepare 原始请求内容哈希与服务端时间戳组成的字符串，
+// 仅用于版本身份与 CAS；数值递增和前后顺序只由 epoch 表达。
 
 export const SPACE_PROTOCOL_VERSION = "cf-sync-v2";
+export const INITIAL_SPACE_REVISION = "0";
 export const DEFAULT_UPLOAD_TTL_SECONDS = 15 * 60;
 export const DEFAULT_MAX_MUTATIONS_PER_BATCH = 32;
 export const DEFAULT_MAX_METADATA_SIZE = 256 * 1024;
@@ -15,6 +18,7 @@ export const DEFAULT_MAX_BATCH_D1_BLOB_BYTES = 8 * 1024 * 1024;
 export const DEFAULT_MAX_R2_BLOB_BYTES = 25 * 1024 * 1024;
 
 export type StorageBackend = "d1" | "r2";
+export type SpaceRevision = string;
 export type UploadBatchState =
   | "prepared"
   | "committing"
@@ -31,7 +35,7 @@ export type UploadItemState =
 
 export interface SpaceRow {
   spaceId: string;
-  revision: number;
+  revision: SpaceRevision;
   epoch: number;
   pendingUploadId: string | null;
   lockExpiresAt: string | null;
@@ -43,7 +47,7 @@ export interface AssetRow {
   assetType: string;
   assetId: string;
   epoch: number;
-  lastModifiedRevision: number;
+  lastModifiedRevision: SpaceRevision;
   contentHash: string;
   byteSize: number;
   encoding: string;
@@ -99,8 +103,8 @@ export interface UploadBatchRow {
   uploadId: string;
   spaceId: string;
   clientBatchId: string;
-  baseRevision: number;
-  targetRevision: number;
+  baseRevision: SpaceRevision;
+  targetRevision: SpaceRevision;
   targetEpoch: number;
   descriptorHash: string;
   state: UploadBatchState;
@@ -139,23 +143,24 @@ export interface PrepareResponse {
   status: "ready";
   uploadId: string;
   commitToken: string;
-  baseRevision: number;
-  targetRevision: number;
+  baseRevision: SpaceRevision;
+  targetRevision: SpaceRevision;
   targetEpoch: number;
   expiresAt: string;
+  serverTime: string;
   uploads: UploadInstruction[];
 }
 
 export interface CommitResult {
   status: "committed" | "already-committed";
   uploadId: string;
-  revision: number;
+  revision: SpaceRevision;
   epoch: number;
   assets: Array<{
     assetType: string;
     assetId: string;
     contentHash: string;
-    lastModifiedRevision: number;
+    lastModifiedRevision: SpaceRevision;
   }>;
   deletedAssets: Array<{
     assetType: string;
@@ -166,7 +171,7 @@ export interface CommitResult {
 
 export interface PlanResponse {
   spaceId: string;
-  revision: number;
+  revision: SpaceRevision;
   epoch: number;
   assets: Array<{
     assetType: string;
@@ -178,7 +183,7 @@ export interface PlanResponse {
     schemaVersion: number;
     storageMode: "full";
     backend: StorageBackend;
-    lastModifiedRevision: number;
+    lastModifiedRevision: SpaceRevision;
     downloadUrl: string;
   }>;
   serverTime: string;
@@ -192,8 +197,8 @@ export interface TransactionInfo {
   uploadId: string;
   clientBatchId: string;
   state: UploadBatchState;
-  baseRevision: number;
-  targetRevision: number;
+  baseRevision: SpaceRevision;
+  targetRevision: SpaceRevision;
   targetEpoch: number;
   expiresAt: string;
   createdAt: string;
@@ -215,7 +220,7 @@ export type AbortStatus =
 export interface AbortResponse {
   status: AbortStatus;
   uploadId?: string;
-  revision?: number;
+  revision?: SpaceRevision;
 }
 
 export interface StorageConfig {
@@ -224,6 +229,26 @@ export interface StorageConfig {
   maxBatchD1BlobBytes: number;
   maxR2BlobBytes: number;
   uploadTtlSeconds: number;
+}
+
+export function isSpaceRevision(value: unknown): value is SpaceRevision {
+  return typeof value === "string" && value.length <= 128 && (
+    /^\d+$/.test(value) || /^[0-9a-f]{64}-\d+$/.test(value)
+  );
+}
+
+export function buildSpaceRevision(
+  requestContentHash: string,
+  serverTimestamp: number,
+): SpaceRevision {
+  if (
+    !/^[0-9a-f]{64}$/.test(requestContentHash) ||
+    !Number.isSafeInteger(serverTimestamp) ||
+    serverTimestamp < 0
+  ) {
+    throw new Error("无法由非法 request content hash 或服务端时间戳构造 revision");
+  }
+  return `${requestContentHash}-${serverTimestamp}`;
 }
 
 export function selectStorageBackend(

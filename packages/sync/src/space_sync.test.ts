@@ -68,19 +68,31 @@ async function objectFor(
 
 async function prepare(
   spaceId: string,
-  baseRevision: number,
+  baseRevision: string,
   clientBatchId: string,
   objects: Awaited<ReturnType<typeof objectFor>>[],
   deletions: Array<{ clientMutationId: string; assetType: string; assetId: string }> = [],
 ): Promise<Response> {
-  return jsonRequest(`/v1/sync/spaces/${spaceId}/mutations`, {
+  return jsonRequest(
+    `/v1/sync/spaces/${spaceId}/mutations`,
+    prepareBody(baseRevision, clientBatchId, objects, deletions),
+  );
+}
+
+function prepareBody(
+  baseRevision: string,
+  clientBatchId: string,
+  objects: Awaited<ReturnType<typeof objectFor>>[],
+  deletions: Array<{ clientMutationId: string; assetType: string; assetId: string }> = [],
+): Record<string, unknown> {
+  return {
     protocol: "cf-sync-v2",
     action: "prepare",
     baseRevision,
     clientBatchId,
     objects,
     deletions,
-  });
+  };
 }
 
 async function uploadAll(
@@ -133,13 +145,68 @@ afterAll(async () => {
 });
 
 describe("cf-sync-v2 space revision 上传事务", () => {
+  it("migration 将所有 space revision 相关列收敛为 TEXT", async () => {
+    const expectations = [
+      ["sync_spaces", "revision"],
+      ["sync_assets", "last_modified_revision"],
+      ["sync_upload_batches", "base_revision"],
+      ["sync_upload_batches", "target_revision"],
+    ] as const;
+    for (const [table, column] of expectations) {
+      const row = await env.DB.prepare(
+        `SELECT type FROM pragma_table_info('${table}') WHERE name=?1`,
+      ).bind(column).first<{ type: string }>();
+      expect(row?.type).toBe("TEXT");
+    }
+  });
+
+  it("迁移前幂等结果中的数值 revision 在读取边界归一化为字符串", async () => {
+    const result = await recoverBatch({
+      uploadId: "legacy-result",
+      spaceId: "legacy-space",
+      clientBatchId: "legacy-client-batch",
+      baseRevision: "0",
+      targetRevision: "1",
+      targetEpoch: 1,
+      descriptorHash: "legacy-descriptor",
+      state: "committed",
+      expiresAt: "2026-08-12T00:00:00.000Z",
+      resultJson: JSON.stringify({
+        status: "committed",
+        uploadId: "legacy-result",
+        revision: 1,
+        epoch: 1,
+        assets: [{
+          assetType: "blueprint",
+          assetId: "legacy-asset",
+          contentHash: "legacy-hash",
+          lastModifiedRevision: 1,
+        }],
+        deletedAssets: [],
+        serverTime: "2026-08-12T00:00:00.000Z",
+      }),
+      lastError: null,
+      createdAt: "2026-08-12T00:00:00.000Z",
+      updatedAt: "2026-08-12T00:00:00.000Z",
+    }, {
+      repo: {} as SpaceRepository,
+      r2Bucket: env.BLOB_STORE,
+      tokenSecret: SECRET,
+      now: Date.now(),
+    });
+    expect(result).toMatchObject({
+      revision: "1",
+      assets: [{ lastModifiedRevision: "1" }],
+    });
+  });
+
   it("兼容正式 D1 将 BLOB 返回为 number[] 的读取形态", async () => {
     const productionLikeRow = {
       space_id: "production-d1-shape",
       asset_type: "blueprint",
       asset_id: "blob-array",
       epoch: 1,
-      last_modified_revision: 1,
+      last_modified_revision: `${"a".repeat(64)}-1770000000000`,
       content_hash: "hash",
       byte_size: 4,
       encoding: "identity",
@@ -189,14 +256,34 @@ describe("cf-sync-v2 space revision 上传事务", () => {
     });
   });
 
+  it("revision HTTP 合约拒绝数值类型并接受迁移后的十进制字符串", async () => {
+    const spaceId = `revision-contract-${crypto.randomUUID()}`;
+    await createSpace(spaceId);
+    const bytes = new TextEncoder().encode("string-revision");
+    const object = await objectFor(bytes, "blueprint", "contract", "m-contract");
+    const numericBaseRevision = await jsonRequest(`/v1/sync/spaces/${spaceId}/mutations`, {
+      ...prepareBody("0", "numeric-revision", [object]),
+      baseRevision: 0,
+    });
+    expect(numericBaseRevision.status).toBe(400);
+    expect(await numericBaseRevision.json()).toMatchObject({ error: "bad_request" });
+
+    const migratedKnownRevision = await request(
+      `/v1/sync/spaces/${spaceId}/check?knownRevision=1`,
+    );
+    expect(migratedKnownRevision.status).toBe(200);
+    expect(await migratedKnownRevision.json()).toMatchObject({ revision: "0", changed: true });
+    expect((await request(`/v1/sync/spaces/${spaceId}/check?knownRevision=0`)).status).toBe(204);
+  });
+
   it("同一 base revision 并发 prepare 只有一个取得整个 space 的锁", async () => {
     const spaceId = `concurrent-${crypto.randomUUID()}`;
     await createSpace(spaceId);
     const bytes = new TextEncoder().encode("concurrent");
     const object = await objectFor(bytes, "blueprint", "a", "m-a");
     const responses = await Promise.all([
-      prepare(spaceId, 0, "client-a", [object]),
-      prepare(spaceId, 0, "client-b", [{ ...object, clientMutationId: "m-b" }]),
+      prepare(spaceId, "0", "client-a", [object]),
+      prepare(spaceId, "0", "client-b", [{ ...object, clientMutationId: "m-b" }]),
     ]);
     expect(responses.map((response) => response.status).sort()).toEqual([200, 409]);
     const conflict = responses.find((response) => response.status === 409)!;
@@ -212,10 +299,14 @@ describe("cf-sync-v2 space revision 上传事务", () => {
       objectFor(firstBytes, "blueprint", "first", "m-first"),
       objectFor(secondBytes, "planner-state", "second", "m-second"),
     ]);
-    const prepareResponse = await prepare(spaceId, 0, "batch-1", objects);
+    const prepareResponse = await prepare(spaceId, "0", "batch-1", objects);
     expect(prepareResponse.status).toBe(200);
     const prepared = await prepareResponse.json() as Record<string, any>;
-    expect(prepared).toMatchObject({ baseRevision: 0, targetRevision: 1, targetEpoch: 1 });
+    expect(prepared).toMatchObject({ baseRevision: "0", targetEpoch: 1 });
+    const requestContent = JSON.stringify(prepareBody("0", "batch-1", objects));
+    expect(prepared.targetRevision).toBe(
+      `${await sha256Hex(requestContent)}-${Date.parse(prepared.serverTime)}`,
+    );
 
     const lockedPlan = await request(`/v1/sync/spaces/${spaceId}/plan`);
     expect(lockedPlan.status).toBe(423);
@@ -231,20 +322,30 @@ describe("cf-sync-v2 space revision 上传事务", () => {
     expect(commitResponse.status).toBe(200);
     expect(await commitResponse.json()).toMatchObject({
       status: "committed",
-      revision: 1,
+      revision: prepared.targetRevision,
       epoch: 1,
     });
     const plan = await (await request(`/v1/sync/spaces/${spaceId}/plan`)).json() as Record<string, any>;
-    expect(plan.revision).toBe(1);
+    expect(plan.revision).toBe(prepared.targetRevision);
     expect(plan.epoch).toBe(1);
     expect(plan.assets).toHaveLength(2);
     expect(plan.assets.map((asset: Record<string, unknown>) => asset.lastModifiedRevision))
-      .toEqual([1, 1]);
+      .toEqual([prepared.targetRevision, prepared.targetRevision]);
+    expect((await request(
+      `/v1/sync/spaces/${spaceId}/check?knownRevision=${prepared.targetRevision}`,
+    )).status).toBe(204);
+    const changed = await request(`/v1/sync/spaces/${spaceId}/check?knownRevision=0`);
+    expect(changed.status).toBe(200);
+    expect(await changed.json()).toMatchObject({
+      revision: prepared.targetRevision,
+      changed: true,
+      planRequired: true,
+    });
 
     const repeatedCommit = await commit(spaceId, prepared);
     expect(await repeatedCommit.json()).toMatchObject({
       status: "already-committed",
-      revision: 1,
+      revision: prepared.targetRevision,
       epoch: 1,
     });
   });
@@ -254,8 +355,8 @@ describe("cf-sync-v2 space revision 上传事务", () => {
     await createSpace(spaceId);
     const bytes = new TextEncoder().encode("same-plan");
     const object = await objectFor(bytes, "blueprint", "same", "m-same");
-    const first = await (await prepare(spaceId, 0, "stable-client-batch", [object])).json() as Record<string, any>;
-    const second = await (await prepare(spaceId, 0, "stable-client-batch", [object])).json() as Record<string, any>;
+    const first = await (await prepare(spaceId, "0", "stable-client-batch", [object])).json() as Record<string, any>;
+    const second = await (await prepare(spaceId, "0", "stable-client-batch", [object])).json() as Record<string, any>;
     expect(second.uploadId).toBe(first.uploadId);
     expect(second.commitToken).toBe(first.commitToken);
   });
@@ -265,7 +366,7 @@ describe("cf-sync-v2 space revision 上传事务", () => {
     await createSpace(spaceId);
     const bytes = new TextEncoder().encode("not-uploaded");
     const object = await objectFor(bytes, "blueprint", "missing", "m-missing");
-    const prepared = await (await prepare(spaceId, 0, "incomplete", [object])).json() as Record<string, any>;
+    const prepared = await (await prepare(spaceId, "0", "incomplete", [object])).json() as Record<string, any>;
     const response = await commit(spaceId, prepared);
     expect(response.status).toBe(409);
     expect(await response.json()).toMatchObject({ error: "uploads_incomplete" });
@@ -276,7 +377,7 @@ describe("cf-sync-v2 space revision 上传事务", () => {
     await createSpace(spaceId);
     const bytes = new TextEncoder().encode("cancel-me");
     const object = await objectFor(bytes, "blueprint", "cancelled", "m-cancel");
-    const prepared = await (await prepare(spaceId, 0, "cancel-batch", [object])).json() as Record<string, any>;
+    const prepared = await (await prepare(spaceId, "0", "cancel-batch", [object])).json() as Record<string, any>;
     expect((await uploadAll(prepared, new Map([["blueprint/cancelled", bytes]])))[0]?.status).toBe(200);
 
     const cancelled = await jsonRequest(`/v1/sync/spaces/${spaceId}/mutations`, {
@@ -288,7 +389,7 @@ describe("cf-sync-v2 space revision 上传事务", () => {
     expect(cancelled.status).toBe(200);
     expect(await cancelled.json()).toMatchObject({ status: "cancelled" });
     const plan = await (await request(`/v1/sync/spaces/${spaceId}/plan`)).json() as Record<string, any>;
-    expect(plan).toMatchObject({ revision: 0, epoch: 0, assets: [] });
+    expect(plan).toMatchObject({ revision: "0", epoch: 0, assets: [] });
   });
 
   it("15 分钟过期批次由清理器释放，旧 base revision 可以重新 prepare", async () => {
@@ -296,7 +397,7 @@ describe("cf-sync-v2 space revision 上传事务", () => {
     await createSpace(spaceId);
     const bytes = new TextEncoder().encode("expires");
     const object = await objectFor(bytes, "blueprint", "expired", "m-expired");
-    const prepared = await (await prepare(spaceId, 0, "expires-batch", [object])).json() as Record<string, any>;
+    const prepared = await (await prepare(spaceId, "0", "expires-batch", [object])).json() as Record<string, any>;
     await env.DB.prepare(
       "UPDATE sync_upload_batches SET expires_at='2000-01-01T00:00:00.000Z' WHERE upload_id=?1",
     ).bind(prepared.uploadId).run();
@@ -305,17 +406,17 @@ describe("cf-sync-v2 space revision 上传事务", () => {
     ).bind(spaceId).run();
     expect(await runScheduledCleanup(env)).toBeGreaterThanOrEqual(1);
 
-    const retry = await prepare(spaceId, 0, "after-expiry", [{ ...object, clientMutationId: "m-after" }]);
+    const retry = await prepare(spaceId, "0", "after-expiry", [{ ...object, clientMutationId: "m-after" }]);
     expect(retry.status).toBe(200);
   });
 
-  it("大对象通过 R2 固定 key 提交，full 模式连续提交保持 epoch=revision", async () => {
+  it("大对象通过 R2 固定 key 提交，full 模式连续提交由 epoch 表达顺序", async () => {
     const spaceId = `r2-${crypto.randomUUID()}`;
     await createSpace(spaceId);
     const firstBytes = new Uint8Array(614_400);
     firstBytes.fill(7);
     const firstObject = await objectFor(firstBytes, "blueprint", "large", "m-large-1");
-    const first = await (await prepare(spaceId, 0, "large-1", [firstObject])).json() as Record<string, any>;
+    const first = await (await prepare(spaceId, "0", "large-1", [firstObject])).json() as Record<string, any>;
     expect(first.uploads[0]).toMatchObject({ required: true, backend: "r2" });
     expect((await uploadAll(first, new Map([["blueprint/large", firstBytes]])))[0]?.status).toBe(200);
     expect((await commit(spaceId, first)).status).toBe(200);
@@ -323,10 +424,10 @@ describe("cf-sync-v2 space revision 上传事务", () => {
     const secondBytes = new Uint8Array(614_401);
     secondBytes.fill(9);
     const secondObject = await objectFor(secondBytes, "blueprint", "large", "m-large-2");
-    const second = await (await prepare(spaceId, 1, "large-2", [secondObject])).json() as Record<string, any>;
+    const second = await (await prepare(spaceId, first.targetRevision, "large-2", [secondObject])).json() as Record<string, any>;
     expect((await uploadAll(second, new Map([["blueprint/large", secondBytes]])))[0]?.status).toBe(200);
     const committed = await (await commit(spaceId, second)).json() as Record<string, any>;
-    expect(committed).toMatchObject({ revision: 2, epoch: 2 });
+    expect(committed).toMatchObject({ revision: second.targetRevision, epoch: 2 });
 
     const rows = await env.DB.prepare(
       "SELECT r2_key FROM sync_assets WHERE space_id=?1 AND asset_type='blueprint' AND asset_id='large'",
@@ -341,13 +442,13 @@ describe("cf-sync-v2 space revision 上传事务", () => {
     await createSpace(spaceId);
     const largeBytes = new Uint8Array(614_400).fill(0x31);
     const largeObject = await objectFor(largeBytes, "blueprint", "deleted", "m-large");
-    const large = await (await prepare(spaceId, 0, "large", [largeObject])).json() as Record<string, any>;
+    const large = await (await prepare(spaceId, "0", "large", [largeObject])).json() as Record<string, any>;
     expect((await uploadAll(large, new Map([["blueprint/deleted", largeBytes]])))[0]?.status).toBe(200);
     expect((await commit(spaceId, large)).status).toBe(200);
 
     const smallBytes = new TextEncoder().encode("active-d1-but-r2-retained");
     const smallObject = await objectFor(smallBytes, "blueprint", "deleted", "m-small");
-    const small = await (await prepare(spaceId, 1, "small", [smallObject])).json() as Record<string, any>;
+    const small = await (await prepare(spaceId, large.targetRevision, "small", [smallObject])).json() as Record<string, any>;
     expect(small.uploads[0]).toMatchObject({ backend: "d1" });
     expect((await uploadAll(small, new Map([["blueprint/deleted", smallBytes]])))[0]?.status).toBe(200);
     expect((await commit(spaceId, small)).status).toBe(200);
@@ -358,7 +459,7 @@ describe("cf-sync-v2 space revision 上传事务", () => {
     expect(row).toMatchObject({ active_backend: "d1", r2_present: 1 });
     expect(await env.BLOB_STORE.head(row!.r2_key)).not.toBeNull();
 
-    const deletion = await prepare(spaceId, 2, "delete", [], [{
+    const deletion = await prepare(spaceId, small.targetRevision, "delete", [], [{
       clientMutationId: "m-delete",
       assetType: "blueprint",
       assetId: "deleted",
@@ -369,7 +470,7 @@ describe("cf-sync-v2 space revision 上传事务", () => {
     const deleted = await (await commit(spaceId, prepared)).json() as Record<string, any>;
     expect(deleted).toMatchObject({
       status: "committed",
-      revision: 3,
+      revision: prepared.targetRevision,
       epoch: 3,
       assets: [],
       deletedAssets: [{ assetType: "blueprint", assetId: "deleted" }],
@@ -380,13 +481,13 @@ describe("cf-sync-v2 space revision 上传事务", () => {
       "SELECT 1 AS present FROM sync_assets WHERE space_id=?1 AND asset_type='blueprint' AND asset_id='deleted'",
     ).bind(spaceId).first()).toBeNull();
     expect(await (await request(`/v1/sync/spaces/${spaceId}/plan`)).json()).toMatchObject({
-      revision: 3,
+      revision: prepared.targetRevision,
       epoch: 3,
       assets: [],
     });
     expect(await (await commit(spaceId, prepared)).json()).toMatchObject({
       status: "already-committed",
-      revision: 3,
+      revision: prepared.targetRevision,
       deletedAssets: [{ assetType: "blueprint", assetId: "deleted" }],
     });
   });
@@ -396,11 +497,11 @@ describe("cf-sync-v2 space revision 上传事务", () => {
     await createSpace(spaceId);
     const bytes = new Uint8Array(614_400).fill(0x52);
     const object = await objectFor(bytes, "blueprint", "recover-delete", "m-create");
-    const created = await (await prepare(spaceId, 0, "create", [object])).json() as Record<string, any>;
+    const created = await (await prepare(spaceId, "0", "create", [object])).json() as Record<string, any>;
     expect((await uploadAll(created, new Map([["blueprint/recover-delete", bytes]])))[0]?.status).toBe(200);
     expect((await commit(spaceId, created)).status).toBe(200);
 
-    const prepared = await (await prepare(spaceId, 1, "delete-recovery", [], [{
+    const prepared = await (await prepare(spaceId, created.targetRevision, "delete-recovery", [], [{
       clientMutationId: "m-delete-recovery",
       assetType: "blueprint",
       assetId: "recover-delete",
@@ -434,9 +535,9 @@ describe("cf-sync-v2 space revision 上传事务", () => {
       tokenSecret: SECRET,
       now: Date.now(),
     });
-    expect(recovered).toMatchObject({ revision: 2, epoch: 2 });
+    expect(recovered).toMatchObject({ revision: prepared.targetRevision, epoch: 2 });
     expect(await (await request(`/v1/sync/spaces/${spaceId}/plan`)).json()).toMatchObject({
-      revision: 2,
+      revision: prepared.targetRevision,
       epoch: 2,
       assets: [],
     });
@@ -445,13 +546,13 @@ describe("cf-sync-v2 space revision 上传事务", () => {
   it("prepare 拒绝空变更集、重复资产和不存在的删除目标", async () => {
     const spaceId = `delete-validation-${crypto.randomUUID()}`;
     await createSpace(spaceId);
-    const empty = await prepare(spaceId, 0, "empty", []);
+    const empty = await prepare(spaceId, "0", "empty", []);
     expect(empty.status).toBe(400);
     expect(await empty.json()).toMatchObject({ error: "bad_request" });
 
     const bytes = new TextEncoder().encode("duplicate-target");
     const object = await objectFor(bytes, "blueprint", "same", "m-write");
-    const duplicate = await prepare(spaceId, 0, "duplicate", [object], [{
+    const duplicate = await prepare(spaceId, "0", "duplicate", [object], [{
       clientMutationId: "m-delete",
       assetType: "blueprint",
       assetId: "same",
@@ -459,7 +560,7 @@ describe("cf-sync-v2 space revision 上传事务", () => {
     expect(duplicate.status).toBe(400);
     expect(await duplicate.json()).toMatchObject({ error: "bad_request" });
 
-    const missing = await prepare(spaceId, 0, "missing", [], [{
+    const missing = await prepare(spaceId, "0", "missing", [], [{
       clientMutationId: "m-missing",
       assetType: "blueprint",
       assetId: "missing",
@@ -467,7 +568,7 @@ describe("cf-sync-v2 space revision 上传事务", () => {
     expect(missing.status).toBe(404);
     expect(await missing.json()).toMatchObject({ error: "asset_not_found" });
     expect(await (await request(`/v1/sync/spaces/${spaceId}/plan`)).json()).toMatchObject({
-      revision: 0,
+      revision: "0",
       epoch: 0,
       assets: [],
     });

@@ -78,7 +78,7 @@ function binary(value: unknown): ArrayBuffer | null {
 function mapSpace(row: Record<string, unknown>): SpaceRow {
   return {
     spaceId: row.space_id as string,
-    revision: row.revision as number,
+    revision: String(row.revision),
     epoch: row.epoch as number,
     pendingUploadId: (row.pending_upload_id as string | null) ?? null,
     lockExpiresAt: (row.lock_expires_at as string | null) ?? null,
@@ -92,7 +92,7 @@ function mapAsset(row: Record<string, unknown>): AssetRow {
     assetType: row.asset_type as string,
     assetId: row.asset_id as string,
     epoch: row.epoch as number,
-    lastModifiedRevision: row.last_modified_revision as number,
+    lastModifiedRevision: String(row.last_modified_revision),
     contentHash: row.content_hash as string,
     byteSize: row.byte_size as number,
     encoding: row.encoding as string,
@@ -121,8 +121,8 @@ function mapBatch(row: Record<string, unknown>): UploadBatchRow {
     uploadId: row.upload_id as string,
     spaceId: row.space_id as string,
     clientBatchId: row.client_batch_id as string,
-    baseRevision: row.base_revision as number,
-    targetRevision: row.target_revision as number,
+    baseRevision: String(row.base_revision),
+    targetRevision: String(row.target_revision),
     targetEpoch: row.target_epoch as number,
     descriptorHash: row.descriptor_hash as string,
     state: row.state as UploadBatchRow["state"],

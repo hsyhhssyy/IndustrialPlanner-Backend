@@ -9,6 +9,7 @@ import type {
   PrepareDeletion,
   PrepareObject,
   PrepareResponse,
+  SpaceRevision,
   SpaceRow,
   StorageConfig,
   TransactionStatusResponse,
@@ -17,6 +18,7 @@ import type {
   UploadItemRow,
 } from "./space_model";
 import {
+  buildSpaceRevision,
   deriveFixedR2Key,
   selectStorageBackend,
 } from "./space_model";
@@ -75,16 +77,13 @@ function canonicalDeletions(deletions: PrepareDeletion[]): PrepareDeletion[] {
 }
 
 async function descriptorHash(
-  objects: PrepareObject[],
-  deletions: PrepareDeletion[],
+  requestContent: string,
 ): Promise<string> {
   // AI-CORRECTION 2026-08-09: 不含删除的既有 v2 批次保留原 descriptor hash，
   // 新删除集合进入同一个幂等描述符，避免跨部署重试漂移。
-  if (deletions.length === 0) return sha256Hex(JSON.stringify(canonicalObjects(objects)));
-  return sha256Hex(JSON.stringify({
-    objects: canonicalObjects(objects),
-    deletions: canonicalDeletions(deletions),
-  }));
+  // AI-CORRECTION 2026-08-12: 每次上传只执行一次 prepare，descriptor hash 改为原始
+  // prepare request content 的 SHA-256，并直接参与目标 revision 构造。
+  return sha256Hex(requestContent);
 }
 
 function batchTokenPayload(batch: UploadBatchRow): BatchTokenPayload {
@@ -96,6 +95,18 @@ function batchTokenPayload(batch: UploadBatchRow): BatchTokenPayload {
     baseRevision: batch.baseRevision,
     descriptorHash: batch.descriptorHash,
     expiresAt: Date.parse(batch.expiresAt),
+  };
+}
+
+function commitResultFromJson(value: string): CommitResult {
+  const parsed = JSON.parse(value) as CommitResult;
+  return {
+    ...parsed,
+    revision: String(parsed.revision),
+    assets: parsed.assets.map((asset) => ({
+      ...asset,
+      lastModifiedRevision: String(asset.lastModifiedRevision),
+    })),
   };
 }
 
@@ -176,6 +187,7 @@ async function responseForBatch(
     targetRevision: batch.targetRevision,
     targetEpoch: batch.targetEpoch,
     expiresAt: batch.expiresAt,
+    serverTime: batch.createdAt,
     uploads: await instructionsForBatch(batch, items, tokenSecret, publicBaseUrl),
   };
 }
@@ -189,7 +201,7 @@ function assertBatchToken(
     payload.uploadId !== batch.uploadId ||
     payload.spaceId !== spaceId ||
     payload.clientBatchId !== batch.clientBatchId ||
-    payload.baseRevision !== batch.baseRevision ||
+    String(payload.baseRevision) !== batch.baseRevision ||
     payload.descriptorHash !== batch.descriptorHash
   ) {
     throw new SpaceProtocolError(403, "token_scope_mismatch", "批次票据与上传事务不匹配");
@@ -303,7 +315,7 @@ async function cancelInternal(batch: UploadBatchRow, deps: BaseDeps): Promise<bo
 
 export async function recoverBatch(batch: UploadBatchRow, deps: BaseDeps): Promise<CommitResult | null> {
   if (batch.state === "committed") {
-    return batch.resultJson ? JSON.parse(batch.resultJson) as CommitResult : null;
+    return batch.resultJson ? commitResultFromJson(batch.resultJson) : null;
   }
   if (batch.state === "cancelling") {
     await cancelInternal(batch, deps);
@@ -320,7 +332,7 @@ export async function recoverBatch(batch: UploadBatchRow, deps: BaseDeps): Promi
   if (!acquired) {
     const updated = await deps.repo.getBatch(batch.uploadId);
     if (updated?.state === "committed" && updated.resultJson) {
-      return JSON.parse(updated.resultJson) as CommitResult;
+      return commitResultFromJson(updated.resultJson);
     }
     throw new SpaceProtocolError(409, "commit_in_progress", "另一提交正在恢复中，请稍后重试");
   }
@@ -360,16 +372,17 @@ export async function recoverSpace(spaceId: string, deps: BaseDeps): Promise<voi
 
 export async function prepareSpaceUpload(
   spaceId: string,
-  baseRevision: number,
+  baseRevision: SpaceRevision,
   clientBatchId: string,
   objects: PrepareObject[],
   deletions: PrepareDeletion[],
+  requestContent: string,
   deps: PrepareDeps,
 ): Promise<PrepareResponse> {
   if (!clientBatchId) {
     throw new SpaceProtocolError(400, "bad_request", "clientBatchId 不能为空");
   }
-  const digest = await descriptorHash(objects, deletions);
+  const digest = await descriptorHash(requestContent);
   const existing = await deps.repo.getBatchByClientId(spaceId, clientBatchId);
   if (existing) {
     if (existing.baseRevision !== baseRevision || existing.descriptorHash !== digest) {
@@ -421,7 +434,7 @@ export async function prepareSpaceUpload(
     spaceId,
     clientBatchId,
     baseRevision,
-    targetRevision: baseRevision + 1,
+    targetRevision: buildSpaceRevision(digest, deps.now),
     targetEpoch: space.epoch + 1,
     descriptorHash: digest,
     state: "prepared",
@@ -607,7 +620,7 @@ export async function commitSpaceUpload(
   assertBatchToken(verified.payload as BatchTokenPayload, batch, spaceId);
   if (batch.state === "committed") {
     if (!batch.resultJson) throw new Error("已提交批次缺少幂等结果");
-    return { ...(JSON.parse(batch.resultJson) as CommitResult), status: "already-committed" };
+    return { ...commitResultFromJson(batch.resultJson), status: "already-committed" };
   }
   if (batch.state === "cancelled" || batch.state === "cancelling") {
     throw new SpaceProtocolError(409, "batch_cancelled", "上传批次已经取消");
@@ -714,9 +727,9 @@ export async function planSpace(
 
 export async function checkSpaceRevision(
   spaceId: string,
-  knownRevision: number,
+  knownRevision: SpaceRevision,
   deps: BaseDeps,
-): Promise<{ revision: number; epoch: number; changed: boolean; planRequired: boolean; serverTime: string }> {
+): Promise<{ revision: SpaceRevision; epoch: number; changed: boolean; planRequired: boolean; serverTime: string }> {
   const space = await assertReadableSpace(spaceId, deps);
   return {
     revision: space.revision,
@@ -746,7 +759,7 @@ export async function downloadSpaceObject(
   }
   const space = await assertReadableSpace(path.spaceId, deps);
   const asset = await deps.repo.getAsset(path.spaceId, path.assetType, path.assetId);
-  if (!asset || payload.revision !== space.revision || payload.blobHash !== asset.contentHash) {
+  if (!asset || String(payload.revision) !== space.revision || payload.blobHash !== asset.contentHash) {
     throw new SpaceProtocolError(409, "download_stale", "下载票据对应的 space revision 已经过期");
   }
   const headers = new Headers({

@@ -1,11 +1,13 @@
 // Space 上传批次与 payload 能力票据。
 
+import type { SpaceRevision } from "./space_model";
+
 export interface BatchTokenPayload {
   kind: "batch";
   uploadId: string;
   spaceId: string;
   clientBatchId: string;
-  baseRevision: number;
+  baseRevision: SpaceRevision;
   descriptorHash: string;
   expiresAt: number;
 }
@@ -27,7 +29,7 @@ export interface DownloadTokenPayload {
   spaceId: string;
   assetType: string;
   assetId: string;
-  revision: number;
+  revision: SpaceRevision;
   blobHash: string;
   expiresAt: number;
 }

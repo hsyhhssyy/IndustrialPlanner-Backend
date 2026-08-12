@@ -10,7 +10,9 @@ import {
   DEFAULT_MAX_R2_BLOB_BYTES,
   DEFAULT_R2_ENTER_THRESHOLD_BYTES,
   DEFAULT_UPLOAD_TTL_SECONDS,
+  INITIAL_SPACE_REVISION,
   SPACE_PROTOCOL_VERSION,
+  isSpaceRevision,
   validatePrepareBatch,
   type StorageConfig,
 } from "./space_model";
@@ -144,22 +146,22 @@ export function createSpaceSyncApp(): Hono<{ Bindings: SpaceSyncEnv }> {
     const createdAt = new Date().toISOString();
     const created = await createSpaceRepository(c.env.DB).createSpace({
       spaceId,
-      revision: 0,
+      revision: INITIAL_SPACE_REVISION,
       epoch: 0,
       pendingUploadId: null,
       lockExpiresAt: null,
       updatedAt: createdAt,
     });
     if (!created) throw new SpaceProtocolError(409, "space_exists", "空间已存在");
-    return wrap(c.json({ ok: true, spaceId, revision: 0, epoch: 0, createdAt }, 201));
+    return wrap(c.json({ ok: true, spaceId, revision: INITIAL_SPACE_REVISION, epoch: 0, createdAt }, 201));
   });
 
   app.get("/v1/sync/spaces/:spaceId/check", async (c) => {
     const raw = c.req.query("knownRevision");
-    if (raw === undefined || !/^\d+$/.test(raw)) {
-      throw new SpaceProtocolError(400, "bad_request", "knownRevision 必须是非负整数");
+    if (!isSpaceRevision(raw)) {
+      throw new SpaceProtocolError(400, "bad_request", "knownRevision 必须是合法 revision 字符串");
     }
-    const result = await checkSpaceRevision(c.req.param("spaceId"), Number(raw), baseDeps(c.env));
+    const result = await checkSpaceRevision(c.req.param("spaceId"), raw, baseDeps(c.env));
     if (!result.changed) return wrap(new Response(null, { status: 204 }));
     return wrap(c.json(result));
   });
@@ -173,6 +175,7 @@ export function createSpaceSyncApp(): Hono<{ Bindings: SpaceSyncEnv }> {
   });
 
   app.post("/v1/sync/spaces/:spaceId/mutations", async (c) => {
+    const requestContent = await c.req.raw.clone().text();
     const body = await jsonBody(c);
     if (body.protocol !== (c.env.PROTOCOL_VERSION ?? SPACE_PROTOCOL_VERSION)) {
       throw new SpaceProtocolError(422, "protocol_mismatch", `需要 ${SPACE_PROTOCOL_VERSION}`);
@@ -180,8 +183,8 @@ export function createSpaceSyncApp(): Hono<{ Bindings: SpaceSyncEnv }> {
     const action = body.action;
     const spaceId = c.req.param("spaceId");
     if (action === "prepare") {
-      if (!Number.isSafeInteger(body.baseRevision) || (body.baseRevision as number) < 0) {
-        throw new SpaceProtocolError(400, "bad_request", "baseRevision 必须是非负整数");
+      if (!isSpaceRevision(body.baseRevision)) {
+        throw new SpaceProtocolError(400, "bad_request", "baseRevision 必须是合法 revision 字符串");
       }
       const validated = validatePrepareBatch(
         body.objects ?? [],
@@ -198,10 +201,11 @@ export function createSpaceSyncApp(): Hono<{ Bindings: SpaceSyncEnv }> {
       }
       const result = await prepareSpaceUpload(
         spaceId,
-        body.baseRevision as number,
+        body.baseRevision,
         typeof body.clientBatchId === "string" ? body.clientBatchId : "",
         validated.objects,
         validated.deletions,
+        requestContent,
         {
           ...baseDeps(c.env),
           publicBaseUrl: publicBaseUrl(c.req.raw, c.env),
