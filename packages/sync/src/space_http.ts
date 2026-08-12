@@ -1,7 +1,7 @@
 // cf-sync-v2 HTTP 适配层。
 
 import { Hono } from "hono";
-import { ANONYMOUS_CORS_HEADERS, handleCorsPreflight, withCors } from "@industrial/shared";
+import { ANONYMOUS_CORS_HEADERS, handleCorsPreflight, withCors, errorDebugInfo } from "@industrial/shared";
 import {
   DEFAULT_D1_RETURN_THRESHOLD_BYTES,
   DEFAULT_MAX_BATCH_D1_BLOB_BYTES,
@@ -42,6 +42,8 @@ export interface SpaceSyncEnv {
   MAX_R2_BLOB_BYTES?: string;
   UPLOAD_TTL_SECONDS?: string;
   LOCAL_DEV_HOST?: string;
+  /** wrangler.toml [vars] 注入的环境标识，用于控制错误调试信息输出 */
+  ENVIRONMENT?: string;
 }
 
 function wrap(response: Response): Response {
@@ -106,7 +108,7 @@ export function createSpaceSyncApp(): Hono<{ Bindings: SpaceSyncEnv }> {
       return wrap(c.json({ error: error.code, message: error.message, ...error.details }, error.status as 400));
     }
     console.error("[sync-v2] 未处理异常", error);
-    return wrap(c.json({ error: "internal_error", message: "同步服务内部错误" }, 500));
+    return wrap(c.json({ error: "internal_error", message: "同步服务内部错误", ...errorDebugInfo(c.env, error) }, 500));
   });
 
   app.options("*", () => handleCorsPreflight(ANONYMOUS_CORS_HEADERS));

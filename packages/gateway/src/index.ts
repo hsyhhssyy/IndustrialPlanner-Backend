@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { handleCorsPreflight, withCors, Errors } from "@industrial/shared";
+import { handleCorsPreflight, withCors, Errors, errorDebugInfo } from "@industrial/shared";
 
 // 当前阶段：仅遥测 Worker 已实现，其他路由返回 501
 const app = new Hono();
@@ -50,7 +50,7 @@ export default {
     } catch (e) {
       // 异常也必须带 CORS 头，否则浏览器报 CORS 错误而非真正的错误信息
       const errorResponse = new Response(
-        JSON.stringify({ error: "bad_gateway", message: `网关转发异常: ${(e as Error).message}` }),
+        JSON.stringify({ error: "bad_gateway", message: "网关转发异常", ...errorDebugInfo(env as { ENVIRONMENT?: string }, e) }),
         { status: 502, headers: { "content-type": "application/json" } },
       );
       return withCors(errorResponse);

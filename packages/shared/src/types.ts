@@ -3,6 +3,10 @@ export interface ApiError {
   error: string;
   message: string;
   details?: unknown;
+  /** 非生产环境时附带的原始错误消息 */
+  originalError?: string;
+  /** 非生产环境时附带的原始错误堆栈 */
+  originalStack?: string;
 }
 
 // 成功响应包装

@@ -6,7 +6,7 @@
 // commit 原子推进 space revision，full-only 模式同时推进 epoch。
 
 import { createSpaceSyncApp, runScheduledCleanup, type SpaceSyncEnv } from "./space_http";
-import { withCors, ANONYMOUS_CORS_HEADERS } from "@industrial/shared";
+import { withCors, ANONYMOUS_CORS_HEADERS, errorDebugInfo } from "@industrial/shared";
 
 const app = createSpaceSyncApp();
 
@@ -18,7 +18,7 @@ export default {
     } catch (e) {
       // 异常也必须带 CORS 头，否则浏览器报 CORS 错误而非真正的错误信息
       const errorResponse = new Response(
-        JSON.stringify({ error: "internal_error", message: `同步服务异常: ${(e as Error).message}` }),
+        JSON.stringify({ error: "internal_error", message: "同步服务异常", ...errorDebugInfo(env, e) }),
         { status: 500, headers: { "content-type": "application/json" } },
       );
       return withCors(errorResponse, ANONYMOUS_CORS_HEADERS);

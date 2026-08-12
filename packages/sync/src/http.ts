@@ -7,6 +7,7 @@ import {
   withCors,
   ANONYMOUS_CORS_HEADERS,
   Errors,
+  errorDebugInfo,
 } from "@industrial/shared";
 import {
   validateProtocolVersion,
@@ -58,6 +59,8 @@ export interface SyncEnv {
   LOCAL_DEV_HOST: string;
   /** 对外能力 URL 的 origin；为空时使用当前请求 origin。 */
   PUBLIC_BASE_URL?: string;
+  /** wrangler.toml [vars] 注入的环境标识，用于控制错误调试信息输出 */
+  ENVIRONMENT?: string;
 }
 
 function positiveInteger(value: string | undefined, fallback: number): number {
@@ -125,7 +128,7 @@ export function createApp() {
     }
     console.error("[sync] 未处理异常", error);
     return wrapWithCors(
-      c.json({ error: "internal_error", message: "同步服务内部错误" }, 500),
+      c.json({ error: "internal_error", message: "同步服务内部错误", ...errorDebugInfo(c.env, error) }, 500),
     );
   });
 

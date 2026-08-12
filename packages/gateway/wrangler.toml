@@ -27,6 +27,9 @@ service = "industrial-sync"
 name = "industrial-gateway-beta"
 workers_dev = true
 
+[env.beta.vars]
+ENVIRONMENT = "beta"
+
 [[env.beta.routes]]
 pattern = "endfield-api.richetriotour.net"
 custom_domain = true
@@ -38,3 +41,6 @@ service = "industrial-sync-beta"
 # 本地开发时，Service Bindings 指向本地运行的 Worker
 [dev]
 port = 8787
+
+[env.production.vars]
+ENVIRONMENT = "production"
