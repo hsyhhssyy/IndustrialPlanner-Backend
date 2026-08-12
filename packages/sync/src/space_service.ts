@@ -315,6 +315,16 @@ export async function recoverBatch(batch: UploadBatchRow, deps: BaseDeps): Promi
   }
   if (batch.state !== "committing") return null;
 
+  // 获取恢复守卫，防止并发 finalizeCommit 竞态
+  const acquired = await deps.repo.acquireRecoverGuard(batch.uploadId);
+  if (!acquired) {
+    const updated = await deps.repo.getBatch(batch.uploadId);
+    if (updated?.state === "committed" && updated.resultJson) {
+      return JSON.parse(updated.resultJson) as CommitResult;
+    }
+    throw new SpaceProtocolError(409, "commit_in_progress", "另一提交正在恢复中，请稍后重试");
+  }
+
   const items = await deps.repo.listItems(batch.uploadId);
   const deletions = await deps.repo.listDeleteItems(batch.uploadId);
   try {
@@ -338,6 +348,8 @@ export async function recoverBatch(batch: UploadBatchRow, deps: BaseDeps): Promi
       iso(deps.now),
     );
     throw error;
+  } finally {
+    await deps.repo.releaseRecoverGuard(batch.uploadId);
   }
 }
 

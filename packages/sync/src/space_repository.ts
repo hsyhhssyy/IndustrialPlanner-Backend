@@ -47,6 +47,8 @@ export interface SpaceRepository {
   markDeleteItemDeleted(uploadId: string, assetType: string, assetId: string, now: string): Promise<boolean>;
   beginCommit(uploadId: string, now: string): Promise<void>;
   finalizeCommit(input: FinalizeUploadInput): Promise<void>;
+  acquireRecoverGuard(uploadId: string): Promise<boolean>;
+  releaseRecoverGuard(uploadId: string): Promise<void>;
   beginCancel(uploadId: string, now: string): Promise<boolean>;
   finishCancel(uploadId: string, now: string): Promise<void>;
   setBatchError(uploadId: string, error: string, now: string): Promise<void>;
@@ -501,6 +503,31 @@ export function createSpaceRepository(db: D1Database): SpaceRepository {
         ).bind(uploadId, now),
         db.prepare("DELETE FROM sync_operation_guards WHERE operation_id=?1").bind(guardId),
       ]);
+    },
+
+    async acquireRecoverGuard(uploadId) {
+      const guardId = `${uploadId}:recover`;
+      try {
+        await db.batch([
+          db.prepare(
+            `INSERT INTO sync_operation_guards(operation_id,guard_key,ok)
+             SELECT ?1,'recover',CASE WHEN EXISTS(
+               SELECT 1 FROM sync_upload_batches WHERE upload_id=?2 AND state='committing'
+             ) THEN 1 ELSE 0 END`,
+          ).bind(guardId, uploadId),
+        ]);
+        return true;
+      } catch (error) {
+        if (!isConstraintConflict(error)) throw error;
+        return false;
+      }
+    },
+
+    async releaseRecoverGuard(uploadId) {
+      const guardId = `${uploadId}:recover`;
+      await db.prepare(
+        "DELETE FROM sync_operation_guards WHERE operation_id=?1 AND guard_key='recover'",
+      ).bind(guardId).run();
     },
 
     async finalizeCommit({ batch, items, deletions, r2Versions, result, committedAt }) {
