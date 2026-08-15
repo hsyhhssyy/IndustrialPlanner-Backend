@@ -1,5 +1,6 @@
 import { describe, it } from "vitest";
 import { measureRequest, formatTimingReport, type TimingResult } from "@industrial/shared";
+import type { TelemetryDb } from "./repository";
 
 // 延迟写入遥测数据（payload 合法时触发 D1 写入）
 const VALID_BODY = JSON.stringify({
@@ -63,23 +64,29 @@ describe("10ms CPU 时间预算验证", () => {
 });
 
 // 内存级 Mock D1（避免 better-sqlite3 原生依赖影响纯逻辑性能测试）
-function createMockDb() {
+function createMockDb(): TelemetryDb {
   const store = new Map<string, unknown[]>();
   return {
-    prepare: (query: string) => ({
-      bind: (...values: unknown[]) => ({
+    prepare: (query: string) => {
+      let boundValues: unknown[] = [];
+      const statement = {
+        bind: (...values: unknown[]) => {
+          boundValues = values;
+          return statement;
+        },
         run: async () => {
           // 模拟 INSERT OR REPLACE
-          if (query.includes("INSERT")) store.set("telemetry", [{ values }]);
+          if (query.includes("INSERT")) store.set("telemetry", [{ values: boundValues }]);
           return { success: true };
         },
-        first: async () => {
-          if (query.includes("SELECT 1")) return { ok: 1 };
+        first: async <T = Record<string, unknown>>() => {
+          if (query.includes("SELECT 1")) return { ok: 1 } as T;
           return null;
         },
-        all: async () => ({ results: [], success: true }),
-      }),
-    }),
+        all: async <T = Record<string, unknown>>() => ({ results: [] as T[], success: true }),
+      };
+      return statement;
+    },
     exec: async () => ({ success: true }),
     batch: async () => [],
   };

@@ -5,7 +5,7 @@ describe("errors", () => {
   it("errorResponse 返回正确结构", () => {
     const res = errorResponse(400, "bad_request", "invalid field", { field: "email" });
     expect(res.status).toBe(400);
-    return res.json().then((body) => {
+    return res.json<{ error: string; message: string; details?: unknown }>().then((body) => {
       expect(body.error).toBe("bad_request");
       expect(body.message).toBe("invalid field");
       expect(body.details).toEqual({ field: "email" });
@@ -15,7 +15,7 @@ describe("errors", () => {
   it("successResponse 返回正确结构", () => {
     const res = successResponse({ id: "1" }, 201);
     expect(res.status).toBe(201);
-    return res.json().then((body) => {
+    return res.json<{ data: { id: string } }>().then((body) => {
       expect(body.data).toEqual({ id: "1" });
     });
   });

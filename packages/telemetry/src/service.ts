@@ -9,7 +9,7 @@ import { parseJsonBody } from "@industrial/shared";
 // 遥测上传结果
 export type TelemetryResult =
   | { ok: true }
-  | { ok: false; status: number; error: string; message: string; retryAfter?: number };
+  | { ok: false; status: 400 | 500 | 503; error: string; message: string; retryAfter?: number };
 
 // 处理匿名遥测上传
 export async function handleTelemetryUpload(

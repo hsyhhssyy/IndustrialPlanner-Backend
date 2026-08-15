@@ -8,7 +8,7 @@ export interface TelemetryRecord {
 }
 
 // 请求校验结果
-export interface TelemetryValidation {
+export type TelemetryValidation = {
   valid: true;
   record: TelemetryRecord;
 } | {

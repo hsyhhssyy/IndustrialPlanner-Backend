@@ -1,8 +1,13 @@
 import { Hono } from "hono";
 import { handleCorsPreflight, withCors, Errors, errorDebugInfo } from "@industrial/shared";
 
+interface GatewayEnv {
+  SYNC?: Fetcher;
+  ENVIRONMENT?: string;
+}
+
 // 当前阶段：仅遥测 Worker 已实现，其他路由返回 501
-const app = new Hono();
+const app = new Hono<{ Bindings: GatewayEnv }>();
 
 // CORS 预检处理
 app.options("*", (c) => {
@@ -27,8 +32,8 @@ app.all("/v1/telemetry/*", async (c) => {
 
 // 同步路由 → 转发到 sync-worker
 app.all("/v1/sync/*", async (c) => {
-  if (c.env?.SYNC && typeof (c.env.SYNC as { fetch: unknown }).fetch === "function") {
-    return (c.env.SYNC as { fetch: (r: Request) => Promise<Response> }).fetch(c.req.raw);
+  if (c.env.SYNC && typeof c.env.SYNC.fetch === "function") {
+    return c.env.SYNC.fetch(c.req.raw);
   }
   return c.json(
     { error: "not_implemented", message: "同步服务未绑定" },
@@ -43,7 +48,7 @@ app.all("*", (c) => {
 
 // 全局 CORS 包装
 export default {
-  fetch: async (request: Request, env: Record<string, unknown>) => {
+  fetch: async (request: Request, env: GatewayEnv) => {
     try {
       const response = await app.fetch(request, env);
       return withCors(response);
