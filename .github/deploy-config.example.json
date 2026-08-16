@@ -5,33 +5,75 @@
   "password": "your-password",
   "image_name": "industrial-sync-dev",
   "stable": {
-    "_comment": "正式环境",
+    "_comment": "正式环境：禁止匿名访问，匿名空间不可用",
     "namespace": "your-stable-namespace",
     "domain": "your-stable-domain.example.com",
     "cloudflare_api_token": "your-stable-cloudflare-api-token",
+    "flags": {
+      "_comment": "部署时注入 gateway/sync 的 ALLOW_ANONYMOUS_SPACES 变量",
+      "allowAnonymousSpaces": false
+    },
+    "oauth": {
+      "_comment": "OIDC Provider 配置：discoveryUrl/clientId/redirectUri 作为 vars 注入 oauth-worker",
+      "discoveryUrl": "<stable-oidc-discovery-url>",
+      "clientId": "<stable-oidc-client-id>",
+      "redirectUri": "<stable-oidc-redirect-uri>"
+    },
     "secrets": {
       "sync": {
         "COMMIT_TOKEN_SECRET": "<secret>",
         "R2_ACCESS_KEY_ID": "<secret>",
         "R2_SECRET_ACCESS_KEY": "<secret>",
         "R2_ACCOUNT_ID": "<secret>",
-        "R2_BUCKET_NAME": "<secret>"
+        "R2_BUCKET_NAME": "<secret>",
+        "JWT_SECRET": "<secret>"
+      },
+      "gateway": {
+        "JWT_SECRET": "<secret>"
+      },
+      "identity": {
+        "JWT_SECRET": "<secret>"
+      },
+      "oauth": {
+        "OIDC_CLIENT_SECRET": "<secret>"
       }
-    }
+    },
+    "_jwt_note": "同一环境内 sync/gateway/identity 的 JWT_SECRET 必须是同一个值"
   },
   "beta": {
-    "_comment": "测试环境",
+    "_comment": "测试环境：允许匿名空间，OAuth 登录也可用",
     "namespace": "your-namespace",
     "domain": "your-domain.example.com",
     "cloudflare_api_token": "your-beta-cloudflare-api-token",
+    "flags": {
+      "_comment": "部署时注入 gateway/sync 的 ALLOW_ANONYMOUS_SPACES 变量",
+      "allowAnonymousSpaces": true
+    },
+    "oauth": {
+      "_comment": "OIDC Provider 配置：discoveryUrl/clientId/redirectUri 作为 vars 注入 oauth-worker",
+      "discoveryUrl": "<beta-oidc-discovery-url>",
+      "clientId": "<beta-oidc-client-id>",
+      "redirectUri": "<beta-oidc-redirect-uri>"
+    },
     "secrets": {
       "sync": {
         "COMMIT_TOKEN_SECRET": "<secret>",
         "R2_ACCESS_KEY_ID": "<secret>",
         "R2_SECRET_ACCESS_KEY": "<secret>",
         "R2_ACCOUNT_ID": "<secret>",
-        "R2_BUCKET_NAME": "<secret>"
+        "R2_BUCKET_NAME": "<secret>",
+        "JWT_SECRET": "<secret>"
+      },
+      "gateway": {
+        "JWT_SECRET": "<secret>"
+      },
+      "identity": {
+        "JWT_SECRET": "<secret>"
+      },
+      "oauth": {
+        "OIDC_CLIENT_SECRET": "<secret>"
       }
-    }
+    },
+    "_jwt_note": "同一环境内 sync/gateway/identity 的 JWT_SECRET 必须是同一个值"
   }
 }
