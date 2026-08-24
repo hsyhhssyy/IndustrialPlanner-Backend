@@ -1,18 +1,27 @@
 // OAuth Worker 入口（空壳，阶段五实现）
 // 能力范围：OAuth 登录身份映射、第三方服务授权连接
+// AI-CORRECTION 2026-08-23: Stage 2 实现单 Provider OIDC 登录身份映射，不保存 Provider token 或提供第三方业务授权连接。
 
-import { Hono } from "hono";
-import { withCors, Errors } from "@industrial/shared";
+import { withCors, errorDebugInfo } from "@industrial/shared";
+import { createOAuthApp, type OAuthEnv } from "./http";
 
-const app = new Hono();
-
-app.all("*", (c) => {
-  return Errors.internal("OAuth Worker 尚未实现");
-});
+const app = createOAuthApp();
 
 export default {
-  fetch: async (request: Request, env: Record<string, unknown>) => {
-    const response = await app.fetch(request, env);
-    return withCors(response);
+  fetch: async (request: Request, env: OAuthEnv) => {
+    try {
+      const response = await app.fetch(request, env);
+      return withCors(response);
+    } catch (error) {
+      const response = new Response(
+        JSON.stringify({
+          error: "internal_error",
+          message: "OAuth 服务异常",
+          ...errorDebugInfo(env, error),
+        }),
+        { status: 500, headers: { "content-type": "application/json" } },
+      );
+      return withCors(response);
+    }
   },
 };

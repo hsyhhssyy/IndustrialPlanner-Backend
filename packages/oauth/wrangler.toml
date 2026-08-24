@@ -1,7 +1,41 @@
 # OAuth Worker — 第三方登录与授权（空壳）
+# AI-CORRECTION 2026-08-23: Stage 2 启用配置化 OIDC 登录，仅由 gateway 通过 Service Binding 暴露。
 name = "industrial-oauth"
 main = "src/index.ts"
 compatibility_date = "2025-08-06"
+workers_dev = false
+preview_urls = false
+
+[[d1_databases]]
+binding = "DB"
+database_name = "oauth-db"
+database_id = "00000000-0000-0000-0000-000000000003"
+
+[[services]]
+binding = "IDENTITY"
+service = "industrial-identity"
+
+[vars]
+OAUTH_LOGIN_TTL_SECONDS = "600"
+OAUTH_CALLBACK_CODE_TTL_SECONDS = "60"
+
+[env.beta]
+name = "industrial-oauth-beta"
+workers_dev = false
+preview_urls = false
+
+[[env.beta.d1_databases]]
+binding = "DB"
+database_name = "oauth-db-beta"
+database_id = "87030033-709b-4e12-8b18-48993e6dbd6b"
+
+[[env.beta.services]]
+binding = "IDENTITY"
+service = "industrial-identity-beta"
+
+[env.beta.vars]
+OAUTH_LOGIN_TTL_SECONDS = "600"
+OAUTH_CALLBACK_CODE_TTL_SECONDS = "60"
 
 [dev]
 port = 8790

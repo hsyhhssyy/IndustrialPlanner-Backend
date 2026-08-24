@@ -14,10 +14,17 @@
       "allowAnonymousSpaces": false
     },
     "oauth": {
-      "_comment": "OIDC Provider 配置：discoveryUrl/clientId/redirectUri 作为 vars 注入 oauth-worker",
+      "_comment": "OIDC Provider callback 与允许的前端完成页，均作为 vars 注入 oauth-worker",
       "discoveryUrl": "<stable-oidc-discovery-url>",
       "clientId": "<stable-oidc-client-id>",
-      "redirectUri": "<stable-oidc-redirect-uri>"
+      "redirectUri": "<stable-oidc-redirect-uri>",
+      "frontendRedirectUris": [
+        "<stable-frontend-oauth-landing-uri>"
+      ]
+    },
+    "d1": {
+      "identityDatabaseId": "<stable-identity-d1-database-id>",
+      "oauthDatabaseId": "<stable-oauth-d1-database-id>"
     },
     "secrets": {
       "sync": {
@@ -32,10 +39,12 @@
         "JWT_SECRET": "<secret>"
       },
       "identity": {
-        "JWT_SECRET": "<secret>"
+        "JWT_SECRET": "<secret>",
+        "INTERNAL_SERVICE_SECRET": "<secret>"
       },
       "oauth": {
-        "OIDC_CLIENT_SECRET": "<secret>"
+        "OIDC_CLIENT_SECRET": "<secret>",
+        "INTERNAL_SERVICE_SECRET": "<secret>"
       }
     },
     "_jwt_note": "同一环境内 sync/gateway/identity 的 JWT_SECRET 必须是同一个值"
@@ -50,10 +59,19 @@
       "allowAnonymousSpaces": true
     },
     "oauth": {
-      "_comment": "OIDC Provider 配置：discoveryUrl/clientId/redirectUri 作为 vars 注入 oauth-worker",
+      "_comment": "OIDC Provider callback 与允许的前端完成页，均作为 vars 注入 oauth-worker",
       "discoveryUrl": "<beta-oidc-discovery-url>",
       "clientId": "<beta-oidc-client-id>",
-      "redirectUri": "<beta-oidc-redirect-uri>"
+      "redirectUri": "<beta-oidc-redirect-uri>",
+      "frontendRedirectUris": [
+        "<beta-dev-frontend-oauth-landing-uri>",
+        "<beta-pre-frontend-oauth-landing-uri>",
+        "<beta-frontend-oauth-landing-uri>"
+      ]
+    },
+    "d1": {
+      "identityDatabaseId": "<beta-identity-d1-database-id>",
+      "oauthDatabaseId": "<beta-oauth-d1-database-id>"
     },
     "secrets": {
       "sync": {
@@ -68,10 +86,12 @@
         "JWT_SECRET": "<secret>"
       },
       "identity": {
-        "JWT_SECRET": "<secret>"
+        "JWT_SECRET": "<secret>",
+        "INTERNAL_SERVICE_SECRET": "<secret>"
       },
       "oauth": {
-        "OIDC_CLIENT_SECRET": "<secret>"
+        "OIDC_CLIENT_SECRET": "<secret>",
+        "INTERNAL_SERVICE_SECRET": "<secret>"
       }
     },
     "_jwt_note": "同一环境内 sync/gateway/identity 的 JWT_SECRET 必须是同一个值"

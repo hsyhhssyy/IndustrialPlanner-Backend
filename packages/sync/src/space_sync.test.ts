@@ -8,10 +8,33 @@ import { runScheduledCleanup } from "./space_http";
 import { createSpaceRepository, type SpaceRepository } from "./space_repository";
 import { recoverBatch } from "./space_service";
 import { sha256Hex } from "./space_token";
+import { signJwt } from "@industrial/shared";
 
 const SECRET = "space-revision-test-secret-with-32-bytes";
+const JWT_SECRET = "sync-test-jwt-secret-with-at-least-32-bytes";
 let proxy: PlatformProxy<{ DB: D1Database; BLOB_STORE: R2Bucket }>;
 let env: SpaceSyncEnv;
+
+function migrationStatements(sql: string): string[] {
+  const statements: string[] = [];
+  let current: string[] = [];
+  let insideTrigger = false;
+
+  for (const rawLine of sql.split("\n")) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("--")) continue;
+    if (current.length === 0) insideTrigger = /^CREATE\s+TRIGGER\b/iu.test(line);
+    current.push(rawLine);
+    const complete = insideTrigger ? /^END;$/iu.test(line) : line.endsWith(";");
+    if (!complete) continue;
+    statements.push(current.join("\n"));
+    current = [];
+    insideTrigger = false;
+  }
+
+  if (current.length > 0) throw new Error("migration 包含未闭合的 SQL statement");
+  return statements;
+}
 
 async function applySchema(db: D1Database): Promise<void> {
   // AI-CORRECTION 2026-08-09: 集成测试必须应用完整 active migration 链，
@@ -22,7 +45,19 @@ async function applySchema(db: D1Database): Promise<void> {
     const executable = sql.split("\n")
       .filter((line) => !line.trimStart().startsWith("--"))
       .join("\n");
-    for (const statement of executable.split(";").map((value) => value.trim()).filter(Boolean)) {
+    // AI-REMOVED 2026-08-23:
+    // Reason: 直接按分号拆分会截断 SQLite trigger 的 BEGIN/END body。
+    // Trigger: owner migration 新增数据库级 insert/update 不变量。
+    // Evidence: Miniflare 报 D1_ERROR incomplete input，完整 migration statement 解析后通过。
+    // Replacement: migrationStatements
+    // Risk: Low
+    // Human Review: Required
+    //
+    // Original code:
+    // for (const statement of executable.split(";").map((value) => value.trim()).filter(Boolean)) {
+    //   await db.prepare(statement).run();
+    // }
+    for (const statement of migrationStatements(executable)) {
       await db.prepare(statement).run();
     }
   }
@@ -137,6 +172,7 @@ beforeAll(async () => {
     MAX_BATCH_D1_BLOB_BYTES: "8388608",
     MAX_R2_BLOB_BYTES: "26214400",
     UPLOAD_TTL_SECONDS: "900",
+    ALLOW_ANONYMOUS_SPACES: "true",
   };
 });
 
@@ -158,6 +194,18 @@ describe("cf-sync-v2 space revision 上传事务", () => {
       ).bind(column).first<{ type: string }>();
       expect(row?.type).toBe("TEXT");
     }
+  });
+
+  it("migration 在数据库层拒绝不一致的 space owner", async () => {
+    const now = new Date().toISOString();
+    await expect(env.DB.prepare(
+      "INSERT INTO sync_spaces (space_id, updated_at, owner_kind, owner_id) VALUES (?1, ?2, 'account', NULL)",
+    ).bind(`invalid-account-${crypto.randomUUID()}`, now).run()).rejects.toThrow("invalid sync space owner");
+    await expect(env.DB.prepare(
+      "INSERT INTO sync_spaces (space_id, updated_at, owner_kind, owner_id) VALUES (?1, ?2, 'anonymous', ?3)",
+    ).bind(`invalid-anonymous-${crypto.randomUUID()}`, now, "unexpected-owner").run()).rejects.toThrow(
+      "invalid sync space owner",
+    );
   });
 
   it("迁移前幂等结果中的数值 revision 在读取边界归一化为字符串", async () => {
@@ -572,5 +620,121 @@ describe("cf-sync-v2 space revision 上传事务", () => {
       epoch: 0,
       assets: [],
     });
+  });
+});
+
+describe("sync 双环境空间归属与防绕过门禁", () => {
+  async function accountToken(accountId: string): Promise<string> {
+    const now = Math.floor(Date.now() / 1000);
+    return signJwt({ sub: accountId, iat: now, exp: now + 300 }, JWT_SECRET);
+  }
+
+  function authenticatedRequest(pathname: string, token: string, init: RequestInit = {}): Promise<Response> {
+    const headers = new Headers(init.headers);
+    headers.set("authorization", `Bearer ${token}`);
+    return request(pathname, { ...init, headers });
+  }
+
+  it("beta 匿名空间与账户空间严格分离，同一账户幂等取得同一空间", async () => {
+    const previousFlag = env.ALLOW_ANONYMOUS_SPACES;
+    const previousSecret = env.JWT_SECRET;
+    env.ALLOW_ANONYMOUS_SPACES = "true";
+    env.JWT_SECRET = JWT_SECRET;
+    try {
+      const anonymousSpaceId = `anonymous-owner-${crypto.randomUUID()}`;
+      await createSpace(anonymousSpaceId);
+
+      const ownerToken = await accountToken("owner-account");
+      const firstMine = await authenticatedRequest("/v1/sync/spaces/mine", ownerToken);
+      const secondMine = await authenticatedRequest("/v1/sync/spaces/mine", ownerToken);
+      expect(firstMine.status).toBe(200);
+      expect(secondMine.status).toBe(200);
+      const firstSpace = await firstMine.json() as { spaceId: string };
+      const secondSpace = await secondMine.json() as { spaceId: string };
+      expect(secondSpace.spaceId).toBe(firstSpace.spaceId);
+
+      expect((await authenticatedRequest(
+        `/v1/sync/spaces/${firstSpace.spaceId}/plan`,
+        ownerToken,
+      )).status).toBe(200);
+      expect((await request(`/v1/sync/spaces/${firstSpace.spaceId}/plan`)).status).toBe(403);
+      expect((await authenticatedRequest(
+        `/v1/sync/spaces/${anonymousSpaceId}/plan`,
+        ownerToken,
+      )).status).toBe(403);
+
+      const otherToken = await accountToken("other-account");
+      expect((await authenticatedRequest(
+        `/v1/sync/spaces/${firstSpace.spaceId}/plan`,
+        otherToken,
+      )).status).toBe(403);
+
+      const invalid = await authenticatedRequest(
+        `/v1/sync/spaces/${anonymousSpaceId}/plan`,
+        "invalid",
+      );
+      expect(invalid.status).toBe(401);
+      expect(await invalid.json()).toMatchObject({ error: "token_invalid" });
+
+      const accountCreatingAnonymous = await authenticatedRequest(
+        "/v1/sync/spaces",
+        ownerToken,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ spaceId: `forbidden-${crypto.randomUUID()}` }),
+        },
+      );
+      expect(accountCreatingAnonymous.status).toBe(403);
+    } finally {
+      env.ALLOW_ANONYMOUS_SPACES = previousFlag;
+      env.JWT_SECRET = previousSecret;
+    }
+  });
+
+  it("stable 仅保留匿名 capabilities，账户空间持合法会话可用", async () => {
+    const previousFlag = env.ALLOW_ANONYMOUS_SPACES;
+    const previousSecret = env.JWT_SECRET;
+    env.ALLOW_ANONYMOUS_SPACES = "false";
+    env.JWT_SECRET = JWT_SECRET;
+    try {
+      expect((await request("/v1/sync/capabilities")).status).toBe(200);
+      const anonymousCreate = await jsonRequest("/v1/sync/spaces", {
+        spaceId: `stable-anonymous-${crypto.randomUUID()}`,
+      });
+      expect(anonymousCreate.status).toBe(401);
+
+      const token = await accountToken("stable-account");
+      const mine = await authenticatedRequest("/v1/sync/spaces/mine", token);
+      expect(mine.status).toBe(200);
+      const { spaceId } = await mine.json() as { spaceId: string };
+      expect((await authenticatedRequest(
+        `/v1/sync/spaces/${spaceId}/check?knownRevision=0`,
+        token,
+      )).status).toBe(204);
+      expect((await request(`/v1/sync/spaces/${spaceId}/plan`)).status).toBe(401);
+    } finally {
+      env.ALLOW_ANONYMOUS_SPACES = previousFlag;
+      env.JWT_SECRET = previousSecret;
+    }
+  });
+
+  it("sync 直连遇到缺失配置时 fail-closed", async () => {
+    const previousFlag = env.ALLOW_ANONYMOUS_SPACES;
+    const previousSecret = env.JWT_SECRET;
+    env.ALLOW_ANONYMOUS_SPACES = undefined;
+    env.JWT_SECRET = undefined;
+    try {
+      const noFlag = await request(`/v1/sync/spaces/missing-${crypto.randomUUID()}/plan`);
+      expect(noFlag.status).toBe(500);
+      env.ALLOW_ANONYMOUS_SPACES = "true";
+      const noSecret = await request(`/v1/sync/spaces/missing-${crypto.randomUUID()}/plan`, {
+        headers: { authorization: "Bearer invalid" },
+      });
+      expect(noSecret.status).toBe(500);
+    } finally {
+      env.ALLOW_ANONYMOUS_SPACES = previousFlag;
+      env.JWT_SECRET = previousSecret;
+    }
   });
 });

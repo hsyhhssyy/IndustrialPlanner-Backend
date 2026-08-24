@@ -2,6 +2,8 @@
 name = "industrial-telemetry"
 main = "src/index.ts"
 compatibility_date = "2025-08-06"
+workers_dev = false
+preview_urls = false
 
 # D1 数据库：遥测记录存储
 [[d1_databases]]
@@ -16,6 +18,8 @@ database_id = "b77bba55-8093-48c0-9007-41b59029ad04"
 
 [env.beta]
 name = "industrial-telemetry-beta"
+workers_dev = false
+preview_urls = false
 
 [[env.beta.d1_databases]]
 binding = "DB"

@@ -18,6 +18,7 @@ export const DEFAULT_MAX_BATCH_D1_BLOB_BYTES = 8 * 1024 * 1024;
 export const DEFAULT_MAX_R2_BLOB_BYTES = 25 * 1024 * 1024;
 
 export type StorageBackend = "d1" | "r2";
+export type SpaceOwnerKind = "anonymous" | "account";
 export type SpaceRevision = string;
 export type UploadBatchState =
   | "prepared"
@@ -35,6 +36,8 @@ export type UploadItemState =
 
 export interface SpaceRow {
   spaceId: string;
+  ownerKind: SpaceOwnerKind;
+  ownerId: string | null;
   revision: SpaceRevision;
   epoch: number;
   pendingUploadId: string | null;

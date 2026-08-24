@@ -1,11 +1,31 @@
 # Identity Worker — 账户与本地认证（空壳）
+# AI-CORRECTION 2026-08-23: Stage 2 启用最小账户与后端会话，并仅允许 Service Binding 调用。
 name = "industrial-identity"
 main = "src/index.ts"
 compatibility_date = "2025-08-06"
+workers_dev = false
+preview_urls = false
 
-# [[d1_databases]]
-# binding = "DB"
-# database_name = "identity-db"
-# database_id = ""
+[[d1_databases]]
+binding = "DB"
+database_name = "identity-db"
+database_id = "00000000-0000-0000-0000-000000000001"
+
+[vars]
+SESSION_TTL_SECONDS = "604800"
+
+[env.beta]
+name = "industrial-identity-beta"
+workers_dev = false
+preview_urls = false
+
+[[env.beta.d1_databases]]
+binding = "DB"
+database_name = "identity-db-beta"
+database_id = "50a8d338-f858-4200-9661-d2a408a10777"
+
+[env.beta.vars]
+SESSION_TTL_SECONDS = "604800"
+
 [dev]
 port = 8789

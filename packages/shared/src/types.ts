@@ -31,6 +31,30 @@ export interface TelemetryShadowV1 {
 // 账户 ID 类型（供跨 Worker 引用）
 export type AccountId = string;
 
+// identity Service Binding 内部协议
+export const INTERNAL_SERVICE_AUTH_HEADER = "x-industrial-internal-auth";
+
+export interface CreateAccountResponse {
+  accountId: AccountId;
+}
+
+export interface CreateSessionRequest {
+  accountId: AccountId;
+}
+
+export interface CreateSessionResponse {
+  accessToken: string;
+  tokenType: "Bearer";
+  expiresAt: string;
+}
+
+export interface OAuthSessionResponse extends CreateSessionResponse {
+  account: {
+    accountId: AccountId;
+    username: string;
+  };
+}
+
 // 资产 ID 类型
 export type AssetId = string;
 

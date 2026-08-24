@@ -2,9 +2,11 @@
 name = "industrial-gateway"
 main = "src/index.ts"
 compatibility_date = "2025-08-06"
+workers_dev = false
+preview_urls = false
 
-# [vars]
-# JWT_SECRET = ""  # identity-worker 实现后配置
+[vars]
+ALLOW_ANONYMOUS_SPACES = "false"
 
 # 路由：所有流量经 Gateway
 [[routes]]
@@ -22,13 +24,23 @@ custom_domain = true
 binding = "SYNC"
 service = "industrial-sync"
 
+[[services]]
+binding = "OAUTH"
+service = "industrial-oauth"
+
+[[services]]
+binding = "TELEMETRY"
+service = "industrial-telemetry"
+
 # Beta 环境：绑定 beta 版 Worker
 [env.beta]
 name = "industrial-gateway-beta"
-workers_dev = true
+workers_dev = false
+preview_urls = false
 
 [env.beta.vars]
 ENVIRONMENT = "beta"
+ALLOW_ANONYMOUS_SPACES = "true"
 
 [[env.beta.routes]]
 pattern = "endfield-api.richetriotour.net"
@@ -37,6 +49,14 @@ custom_domain = true
 [[env.beta.services]]
 binding = "SYNC"
 service = "industrial-sync-beta"
+
+[[env.beta.services]]
+binding = "OAUTH"
+service = "industrial-oauth-beta"
+
+[[env.beta.services]]
+binding = "TELEMETRY"
+service = "industrial-telemetry-beta"
 
 # 本地开发时，Service Bindings 指向本地运行的 Worker
 [dev]

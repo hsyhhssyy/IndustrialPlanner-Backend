@@ -40,6 +40,15 @@ importers:
       '@cloudflare/workers-types':
         specifier: ^4.20250801.0
         version: 4.20260702.1
+      esbuild:
+        specifier: ^0.28.1
+        version: 0.28.1
+      jose:
+        specifier: ^6.2.10
+        version: 6.2.10
+      miniflare:
+        specifier: 5.20260730.0-alpha
+        version: 5.20260730.0-alpha
       vitest:
         specifier: ^3.2.0
         version: 3.2.7(@types/node@26.1.2)(supports-color@10.2.2)
@@ -59,8 +68,14 @@ importers:
       '@cloudflare/workers-types':
         specifier: ^4.20250801.0
         version: 4.20260702.1
+      miniflare:
+        specifier: 5.20260730.0-alpha
+        version: 5.20260730.0-alpha
+      vitest:
+        specifier: ^3.2.7
+        version: 3.2.7(@types/node@26.1.2)(supports-color@10.2.2)
       wrangler:
-        specifier: ^4.20.0
+        specifier: ^4.118.0
         version: 4.118.0(@cloudflare/workers-types@4.20260702.1)
 
   packages/oauth:
@@ -71,15 +86,31 @@ importers:
       hono:
         specifier: ^4.8.0
         version: 4.13.0
+      openid-client:
+        specifier: ^6.8.7
+        version: 6.8.7
     devDependencies:
       '@cloudflare/workers-types':
         specifier: ^4.20250801.0
         version: 4.20260702.1
+      jose:
+        specifier: ^6.2.10
+        version: 6.2.10
+      miniflare:
+        specifier: 5.20260730.0-alpha
+        version: 5.20260730.0-alpha
+      vitest:
+        specifier: ^3.2.7
+        version: 3.2.7(@types/node@26.1.2)(supports-color@10.2.2)
       wrangler:
-        specifier: ^4.20.0
+        specifier: ^4.118.0
         version: 4.118.0(@cloudflare/workers-types@4.20260702.1)
 
   packages/shared:
+    dependencies:
+      jose:
+        specifier: ^6.2.10
+        version: 6.2.10
     devDependencies:
       '@cloudflare/workers-types':
         specifier: ^4.20250801.0
@@ -906,6 +937,9 @@ packages:
     resolution: {integrity: sha512-jhunvfHWxd7J5EFfSgH4xsYJzSe/lfqbUCxiyyeaQasUsXeEHXtzVid+7EOGByc5JnFa23SSFL3Y2RV/z1T+eQ==}
     engines: {node: '>=16.9.0'}
 
+  jose@6.2.10:
+    resolution: {integrity: sha512-iiW7J9qRFlGxvCOIBDBDxFePQSn7ZMAnrYGhrrOo6siO/MIqwfyilLR27pkfDgUk+raLuzADS8A3S/KLBisc0g==}
+
   js-tokens@9.0.1:
     resolution: {integrity: sha512-mxa9E9ITFOt0ban3j6L5MpjwegGz6lBQmM1IJkWeBZGcMxto50+eWdjC/52xDbS2vy0k7vIMK0Fe2wfL9OQSpQ==}
 
@@ -934,6 +968,12 @@ packages:
   node-addon-api@8.9.1:
     resolution: {integrity: sha512-4eUQWVPCUUUiBjLnHS3cXWeC6ryoPUc0U3rP7IuzapoGbzMqd/r6KKO0clr0b+snQhsrueFEhCZDdK+LK7hxKg==}
     engines: {node: ^18 || ^20 || >= 21}
+
+  oauth4webapi@3.8.7:
+    resolution: {integrity: sha512-4RxcKxXjuItDFZ20RRPf4YTw3kpeXJyCgJFxVzJ068A7PNJ18st2Dg90tlC1LkSDS0GecroagCLHYEIVUhCAkw==}
+
+  openid-client@6.8.7:
+    resolution: {integrity: sha512-gtKthNu7evSBvTdrrlHb4F3Fi9dcwlb5QaITlCs+9mfpvuOi0Q3qtBf5+iY4sEP8hy1qCoAdxBNPDcmZeVSDzQ==}
 
   path-to-regexp@6.3.0:
     resolution: {integrity: sha512-Yhpw4T9C6hPpgPeA28us07OJeqZ5EzQTkbfwuhsUg0c237RomFoETJgmp2sa3F/41gfLE6G5cqcYwznmeEeOlQ==}
@@ -1808,6 +1848,8 @@ snapshots:
 
   hono@4.13.0: {}
 
+  jose@6.2.10: {}
+
   js-tokens@9.0.1: {}
 
   kleur@4.1.5: {}
@@ -1835,6 +1877,13 @@ snapshots:
   nanoid@3.3.17: {}
 
   node-addon-api@8.9.1: {}
+
+  oauth4webapi@3.8.7: {}
+
+  openid-client@6.8.7:
+    dependencies:
+      jose: 6.2.10
+      oauth4webapi: 3.8.7
 
   path-to-regexp@6.3.0: {}
 

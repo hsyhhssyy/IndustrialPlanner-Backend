@@ -99,35 +99,148 @@ jobs:
           config_file="$RUNNER_TEMP/deploy-config.json"
           printf '%s' "$DEPLOY_CONFIG" > "$config_file"
           cf_token="$(jq -r --arg environment "$CF_ENVIRONMENT" '.[$environment].cloudflare_api_token' "$config_file")"
-          if [ -z "$cf_token" ] || [ "$cf_token" = 'null' ]; then
+          if [ -z "$cf_token" ] || [ "$cf_token" = 'null' ] || [[ "$cf_token" == *'<'* ]]; then
             echo "Missing or null: $CF_ENVIRONMENT.cloudflare_api_token" >&2
             exit 1
           fi
           if ! jq -e --arg environment "$CF_ENVIRONMENT" '
-            .[$environment].secrets.sync as $sync
-            | ($sync | type == "object")
+            def configured:
+              type == "string" and length > 0
+              and (contains("<") | not)
+              and (test("[\\r\\n]") | not);
+            def secret32: configured and length >= 32;
+            def uuid:
+              configured
+              and test("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+              and . != "00000000-0000-0000-0000-000000000000";
+            .[$environment] as $target
+            | $target.secrets.sync as $sync
+            | $target.secrets.gateway as $gateway
+            | $target.secrets.identity as $identity
+            | $target.secrets.oauth as $oauth_secret
+            | $target.oauth as $oauth
+            | ($target.flags.allowAnonymousSpaces | type == "boolean")
+              and (if $environment == "stable"
+                then $target.flags.allowAnonymousSpaces == false
+                else $target.flags.allowAnonymousSpaces == true
+              end)
+              and ($sync | type == "object")
               and ($sync.COMMIT_TOKEN_SECRET | type == "string" and length >= 32)
-              and ($sync.R2_ACCESS_KEY_ID | type == "string" and length > 0)
-              and ($sync.R2_SECRET_ACCESS_KEY | type == "string" and length > 0)
-              and ($sync.R2_ACCOUNT_ID | type == "string" and length > 0)
-              and ($sync.R2_BUCKET_NAME | type == "string" and length > 0)
+              and ($sync.R2_ACCESS_KEY_ID | configured)
+              and ($sync.R2_SECRET_ACCESS_KEY | configured)
+              and ($sync.R2_ACCOUNT_ID | configured)
+              and ($sync.R2_BUCKET_NAME | configured)
+              and ($sync.JWT_SECRET | secret32)
+              and ($gateway.JWT_SECRET | secret32)
+              and ($identity.JWT_SECRET | secret32)
+              and ($sync.JWT_SECRET == $gateway.JWT_SECRET)
+              and ($gateway.JWT_SECRET == $identity.JWT_SECRET)
+              and ($identity.INTERNAL_SERVICE_SECRET | secret32)
+              and ($oauth_secret.INTERNAL_SERVICE_SECRET | secret32)
+              and ($identity.INTERNAL_SERVICE_SECRET == $oauth_secret.INTERNAL_SERVICE_SECRET)
+              and ($oauth_secret.OIDC_CLIENT_SECRET | configured)
+              and ($oauth.discoveryUrl | configured and startswith("https://") and endswith("/.well-known/openid-configuration"))
+              and ($oauth.clientId | configured)
+              and ($oauth.redirectUri | configured and startswith("https://"))
+              and ($oauth.frontendRedirectUris | type == "array" and length > 0 and length <= 32)
+              and ($oauth.frontendRedirectUris | all(.[];
+                configured
+                and startswith("https://")
+                and (contains("?") | not)
+                and (contains("#") | not)
+              ))
+              and (($oauth.frontendRedirectUris | unique | length) == ($oauth.frontendRedirectUris | length))
+              and ($target.d1.identityDatabaseId | uuid)
+              and ($target.d1.oauthDatabaseId | uuid)
           ' "$config_file" >/dev/null; then
-            echo "Missing or invalid: $CF_ENVIRONMENT.secrets.sync" >&2
+            echo "Missing, placeholder, inconsistent, or invalid deploy config for $CF_ENVIRONMENT" >&2
             exit 1
           fi
+          if ! node - "$config_file" "$CF_ENVIRONMENT" <<'NODE'
+          const fs = require("node:fs");
+
+          let valid = false;
+          try {
+            const [configFile, environment] = process.argv.slice(2);
+            const values = JSON.parse(fs.readFileSync(configFile, "utf8"))[environment]
+              .oauth.frontendRedirectUris;
+            const normalized = values.map((value) => {
+              if (value.length > 2048 || value.includes("?") || value.includes("#")) {
+                throw new Error("unsafe URL");
+              }
+              const url = new URL(value);
+              if (url.protocol !== "https:" || url.username || url.password) {
+                throw new Error("unsafe URL");
+              }
+              return url.href;
+            });
+            valid = new Set(normalized).size === normalized.length;
+          } catch {
+            valid = false;
+          }
+          if (!valid) process.exit(1);
+          NODE
+          then
+            echo "Invalid OAuth frontend redirect URI configuration for $CF_ENVIRONMENT" >&2
+            exit 1
+          fi
+          while IFS= read -r secret_value; do
+            echo "::add-mask::$secret_value"
+          done < <(jq -r --arg environment "$CF_ENVIRONMENT" '
+            .[$environment].secrets | .. | strings
+          ' "$config_file")
           echo "::add-mask::$cf_token"
           echo "CLOUDFLARE_API_TOKEN=$cf_token" >> "$GITHUB_ENV"
           echo "DEPLOY_CONFIG_FILE=$config_file" >> "$GITHUB_ENV"
+          echo "ALLOW_ANONYMOUS_SPACES=$(jq -r --arg environment "$CF_ENVIRONMENT" '.[$environment].flags.allowAnonymousSpaces' "$config_file")" >> "$GITHUB_ENV"
+          echo "OIDC_DISCOVERY_URL=$(jq -r --arg environment "$CF_ENVIRONMENT" '.[$environment].oauth.discoveryUrl' "$config_file")" >> "$GITHUB_ENV"
+          echo "OIDC_CLIENT_ID=$(jq -r --arg environment "$CF_ENVIRONMENT" '.[$environment].oauth.clientId' "$config_file")" >> "$GITHUB_ENV"
+          echo "OIDC_REDIRECT_URI=$(jq -r --arg environment "$CF_ENVIRONMENT" '.[$environment].oauth.redirectUri' "$config_file")" >> "$GITHUB_ENV"
+          # AI-REMOVED 2026-08-24:
+          # Reason: 单一前端地址无法表达 dev、pre、beta 共用 Beta 后端的精确 allowlist。
+          # Trigger: 用户明确要求前端携带完整 URL，且不保留 Beta 旧协议兼容。
+          # Evidence: oauth.frontendRedirectUris 配置校验与 OAuth D1 事务快照。
+          # Replacement: OAUTH_FRONTEND_REDIRECT_URIS
+          # Risk: Low
+          # Human Review: Required
+          #
+          # Original code:
+          # echo "OAUTH_FRONTEND_REDIRECT_URI=$(jq -r --arg environment "$CF_ENVIRONMENT" '.[$environment].oauth.frontendRedirectUri // .[$environment].oauth.redirectUri' "$config_file")" >> "$GITHUB_ENV"
+          echo "OAUTH_FRONTEND_REDIRECT_URIS=$(jq -c --arg environment "$CF_ENVIRONMENT" '.[$environment].oauth.frontendRedirectUris' "$config_file")" >> "$GITHUB_ENV"
+          echo "IDENTITY_D1_ID=$(jq -r --arg environment "$CF_ENVIRONMENT" '.[$environment].d1.identityDatabaseId' "$config_file")" >> "$GITHUB_ENV"
+          echo "OAUTH_D1_ID=$(jq -r --arg environment "$CF_ENVIRONMENT" '.[$environment].d1.oauthDatabaseId' "$config_file")" >> "$GITHUB_ENV"
+
+      - name: Materialize environment bindings
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$CF_ENVIRONMENT" = 'beta' ]; then
+            sed -i "s/00000000-0000-0000-0000-000000000002/$IDENTITY_D1_ID/" packages/identity/wrangler.toml
+            sed -i "s/00000000-0000-0000-0000-000000000004/$OAUTH_D1_ID/" packages/oauth/wrangler.toml
+          else
+            sed -i "s/00000000-0000-0000-0000-000000000001/$IDENTITY_D1_ID/" packages/identity/wrangler.toml
+            sed -i "s/00000000-0000-0000-0000-000000000003/$OAUTH_D1_ID/" packages/oauth/wrangler.toml
+          fi
+          jq -c --arg environment "$CF_ENVIRONMENT" '.[$environment].secrets.identity' "$DEPLOY_CONFIG_FILE" > "$RUNNER_TEMP/identity-secrets.json"
+          jq -c --arg environment "$CF_ENVIRONMENT" '.[$environment].secrets.oauth' "$DEPLOY_CONFIG_FILE" > "$RUNNER_TEMP/oauth-secrets.json"
+          jq -c --arg environment "$CF_ENVIRONMENT" '.[$environment].secrets.sync' "$DEPLOY_CONFIG_FILE" > "$RUNNER_TEMP/sync-secrets.json"
+          jq -c --arg environment "$CF_ENVIRONMENT" '.[$environment].secrets.gateway' "$DEPLOY_CONFIG_FILE" > "$RUNNER_TEMP/gateway-secrets.json"
 
       - name: Apply D1 migrations
         shell: bash
         run: |
           set -euo pipefail
           if [ "$CF_ENVIRONMENT" = 'beta' ]; then
+            pnpm --filter @industrial/identity exec -- npx wrangler d1 migrations apply DB --remote --env beta
+            pnpm --filter @industrial/oauth exec -- npx wrangler d1 migrations apply DB --remote --env beta
             pnpm --filter @industrial/sync exec -- npx wrangler d1 migrations apply sync-db-beta --remote --env beta
             # AI-REMOVED 2026-08-09: telemetry Beta 尚有独立未提交改造，不能绑进 RQ-007 发布。
             # Original code: pnpm --filter @industrial/telemetry exec -- npx wrangler d1 migrations apply telemetry-db-beta --remote --env beta
+            # AI-CORRECTION 2026-08-23: Stage 2 由 gateway 统一暴露匿名 telemetry，重新纳入 beta 部署闭环。
+            pnpm --filter @industrial/telemetry exec -- npx wrangler d1 migrations apply telemetry-db-beta --remote --env beta
           else
+            pnpm --filter @industrial/identity exec -- npx wrangler d1 migrations apply DB --remote
+            pnpm --filter @industrial/oauth exec -- npx wrangler d1 migrations apply DB --remote
             pnpm --filter @industrial/sync exec -- npx wrangler d1 migrations apply sync-db --remote
             pnpm --filter @industrial/telemetry exec -- npx wrangler d1 migrations apply telemetry-db --remote
           fi
@@ -137,19 +250,75 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$CF_ENVIRONMENT" = 'beta' ]; then
-            pnpm --filter @industrial/sync exec -- npx wrangler deploy --env beta
-            jq -c '.beta.secrets.sync' "$DEPLOY_CONFIG_FILE" \
-              | (cd packages/sync && pnpm exec wrangler secret bulk --env beta)
+            pnpm --filter @industrial/identity exec -- npx wrangler deploy --env beta --secrets-file "$RUNNER_TEMP/identity-secrets.json"
+            # AI-REMOVED 2026-08-24:
+            # Reason: oauth-worker 不再接受单一前端落地地址。
+            # Trigger: 多前端精确 URL allowlist 协议替代旧 Beta callback。
+            # Evidence: OAUTH_FRONTEND_REDIRECT_URIS 运行时配置与 OAuth D1 事务快照。
+            # Replacement: 下方 OAUTH_FRONTEND_REDIRECT_URIS 参数。
+            # Risk: Low
+            # Human Review: Required
+            # Original code: --var "OAUTH_FRONTEND_REDIRECT_URI:$OAUTH_FRONTEND_REDIRECT_URI"
+            pnpm --filter @industrial/oauth exec -- npx wrangler deploy --env beta \
+              --secrets-file "$RUNNER_TEMP/oauth-secrets.json" \
+              --var "OIDC_DISCOVERY_URL:$OIDC_DISCOVERY_URL" \
+              --var "OIDC_CLIENT_ID:$OIDC_CLIENT_ID" \
+              --var "OIDC_REDIRECT_URI:$OIDC_REDIRECT_URI" \
+              --var "OAUTH_FRONTEND_REDIRECT_URIS:$OAUTH_FRONTEND_REDIRECT_URIS"
+            pnpm --filter @industrial/sync exec -- npx wrangler deploy --env beta \
+              --secrets-file "$RUNNER_TEMP/sync-secrets.json" \
+              --var "ALLOW_ANONYMOUS_SPACES:$ALLOW_ANONYMOUS_SPACES"
+            # AI-REMOVED 2026-08-23:
+            # Reason: deploy --secrets-file 已将源码、vars 与 secrets 原子上传，部署后再次 bulk 会产生多余版本。
+            # Trigger: Stage 2 部署闭环要求 Worker 不经历缺失鉴权 secret 的中间版本。
+            # Evidence: Wrangler deploy 4.118.0 支持 --secrets-file。
+            # Replacement: 上方 sync deploy --secrets-file。
+            # Risk: Low
+            # Human Review: Required
+            #
+            # Original code:
+            # jq -c '.beta.secrets.sync' "$DEPLOY_CONFIG_FILE" \
+            #   | (cd packages/sync && pnpm exec wrangler secret bulk --env beta)
             # AI-REMOVED 2026-08-09: telemetry Beta 等其业务改造独立验收后再接入。
             # Original code: pnpm --filter @industrial/telemetry exec -- npx wrangler deploy --env beta
-            pnpm --filter @industrial/gateway exec -- npx wrangler deploy --env beta
+            # AI-CORRECTION 2026-08-23: Stage 2 的 gateway TELEMETRY binding 需要对应 beta Worker。
+            pnpm --filter @industrial/telemetry exec -- npx wrangler deploy --env beta
+            pnpm --filter @industrial/gateway exec -- npx wrangler deploy --env beta \
+              --secrets-file "$RUNNER_TEMP/gateway-secrets.json" \
+              --var "ALLOW_ANONYMOUS_SPACES:$ALLOW_ANONYMOUS_SPACES"
           else
-            pnpm --filter @industrial/sync exec -- npx wrangler deploy
-            jq -c '.stable.secrets.sync' "$DEPLOY_CONFIG_FILE" \
-              | (cd packages/sync && pnpm exec wrangler secret bulk)
+            pnpm --filter @industrial/identity exec -- npx wrangler deploy --secrets-file "$RUNNER_TEMP/identity-secrets.json"
+            # AI-REMOVED 2026-08-24:
+            # Reason: oauth-worker 不再接受单一前端落地地址。
+            # Trigger: 多前端精确 URL allowlist 协议替代旧 Beta callback。
+            # Evidence: OAUTH_FRONTEND_REDIRECT_URIS 运行时配置与 OAuth D1 事务快照。
+            # Replacement: 下方 OAUTH_FRONTEND_REDIRECT_URIS 参数。
+            # Risk: Low
+            # Human Review: Required
+            # Original code: --var "OAUTH_FRONTEND_REDIRECT_URI:$OAUTH_FRONTEND_REDIRECT_URI"
+            pnpm --filter @industrial/oauth exec -- npx wrangler deploy \
+              --secrets-file "$RUNNER_TEMP/oauth-secrets.json" \
+              --var "OIDC_DISCOVERY_URL:$OIDC_DISCOVERY_URL" \
+              --var "OIDC_CLIENT_ID:$OIDC_CLIENT_ID" \
+              --var "OIDC_REDIRECT_URI:$OIDC_REDIRECT_URI" \
+              --var "OAUTH_FRONTEND_REDIRECT_URIS:$OAUTH_FRONTEND_REDIRECT_URIS"
+            pnpm --filter @industrial/sync exec -- npx wrangler deploy \
+              --secrets-file "$RUNNER_TEMP/sync-secrets.json" \
+              --var "ALLOW_ANONYMOUS_SPACES:$ALLOW_ANONYMOUS_SPACES"
+            # AI-REMOVED 2026-08-23:
+            # Reason: deploy --secrets-file 已将源码、vars 与 secrets 原子上传，部署后再次 bulk 会产生多余版本。
+            # Trigger: Stage 2 部署闭环要求 Worker 不经历缺失鉴权 secret 的中间版本。
+            # Evidence: Wrangler deploy 4.118.0 支持 --secrets-file。
+            # Replacement: 上方 sync deploy --secrets-file。
+            # Risk: Low
+            # Human Review: Required
+            #
+            # Original code:
+            # jq -c '.stable.secrets.sync' "$DEPLOY_CONFIG_FILE" \
+            #   | (cd packages/sync && pnpm exec wrangler secret bulk)
             pnpm --filter @industrial/telemetry exec -- npx wrangler deploy
-            pnpm --filter @industrial/identity exec -- npx wrangler deploy
-            pnpm --filter @industrial/oauth exec -- npx wrangler deploy
             pnpm --filter @industrial/assets exec -- npx wrangler deploy
-            pnpm --filter @industrial/gateway exec -- npx wrangler deploy
+            pnpm --filter @industrial/gateway exec -- npx wrangler deploy \
+              --secrets-file "$RUNNER_TEMP/gateway-secrets.json" \
+              --var "ALLOW_ANONYMOUS_SPACES:$ALLOW_ANONYMOUS_SPACES"
           fi

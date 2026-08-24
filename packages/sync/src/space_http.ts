@@ -1,7 +1,13 @@
 // cf-sync-v2 HTTP 适配层。
 
 import { Hono } from "hono";
-import { ANONYMOUS_CORS_HEADERS, handleCorsPreflight, withCors, errorDebugInfo } from "@industrial/shared";
+import {
+  ANONYMOUS_CORS_HEADERS,
+  handleCorsPreflight,
+  withCors,
+  errorDebugInfo,
+  verifyRequestJwt,
+} from "@industrial/shared";
 import {
   DEFAULT_D1_RETURN_THRESHOLD_BYTES,
   DEFAULT_MAX_BATCH_D1_BLOB_BYTES,
@@ -44,8 +50,18 @@ export interface SpaceSyncEnv {
   MAX_R2_BLOB_BYTES?: string;
   UPLOAD_TTL_SECONDS?: string;
   LOCAL_DEV_HOST?: string;
+  ALLOW_ANONYMOUS_SPACES?: string;
+  JWT_SECRET?: string;
   /** wrangler.toml [vars] 注入的环境标识，用于控制错误调试信息输出 */
   ENVIRONMENT?: string;
+}
+
+type RequestIdentity =
+  | { kind: "anonymous" }
+  | { kind: "account"; accountId: string };
+
+interface SpaceSyncVariables {
+  identity: RequestIdentity;
 }
 
 function wrap(response: Response): Response {
@@ -72,6 +88,57 @@ function tokenSecret(env: SpaceSyncEnv): string {
     throw new SpaceProtocolError(500, "configuration_error", "缺少 COMMIT_TOKEN_SECRET");
   }
   return env.COMMIT_TOKEN_SECRET;
+}
+
+function allowAnonymousSpaces(env: SpaceSyncEnv): boolean {
+  if (env.ALLOW_ANONYMOUS_SPACES === "true") return true;
+  if (env.ALLOW_ANONYMOUS_SPACES === "false") return false;
+  throw new SpaceProtocolError(500, "configuration_error", "ALLOW_ANONYMOUS_SPACES 配置无效");
+}
+
+async function authenticateRequest(
+  request: Request,
+  env: SpaceSyncEnv,
+  accountRequired: boolean,
+): Promise<RequestIdentity> {
+  const authorization = request.headers.get("authorization");
+  if (authorization === null) {
+    if (accountRequired || !allowAnonymousSpaces(env)) {
+      throw new SpaceProtocolError(401, "token_missing", "需要 Bearer 会话");
+    }
+    return { kind: "anonymous" };
+  }
+  if (!env.JWT_SECRET) {
+    throw new SpaceProtocolError(500, "configuration_error", "JWT_SECRET 配置无效");
+  }
+  let verification;
+  try {
+    verification = await verifyRequestJwt(request, env.JWT_SECRET);
+  } catch {
+    throw new SpaceProtocolError(500, "configuration_error", "JWT_SECRET 配置无效");
+  }
+  if (!verification.ok) {
+    throw new SpaceProtocolError(401, verification.code, "Bearer 会话无效或已过期");
+  }
+  return { kind: "account", accountId: verification.accountId };
+}
+
+async function assertSpaceAccess(
+  spaceId: string,
+  identity: RequestIdentity,
+  env: SpaceSyncEnv,
+): Promise<void> {
+  const space = await createSpaceRepository(env.DB).getSpace(spaceId);
+  if (!space) throw new SpaceProtocolError(404, "space_not_found", "空间不存在");
+  if (identity.kind === "anonymous") {
+    if (space.ownerKind !== "anonymous") {
+      throw new SpaceProtocolError(403, "space_forbidden", "无权访问账户空间");
+    }
+    return;
+  }
+  if (space.ownerKind !== "account" || space.ownerId !== identity.accountId) {
+    throw new SpaceProtocolError(403, "space_forbidden", "无权访问该空间");
+  }
 }
 
 function publicBaseUrl(request: Request, env: SpaceSyncEnv): string {
@@ -102,8 +169,14 @@ async function jsonBody(c: { req: { header(name: string): string | undefined; js
   }
 }
 
-export function createSpaceSyncApp(): Hono<{ Bindings: SpaceSyncEnv }> {
-  const app = new Hono<{ Bindings: SpaceSyncEnv }>();
+export function createSpaceSyncApp(): Hono<{
+  Bindings: SpaceSyncEnv;
+  Variables: SpaceSyncVariables;
+}> {
+  const app = new Hono<{
+    Bindings: SpaceSyncEnv;
+    Variables: SpaceSyncVariables;
+  }>();
 
   app.onError((error, c) => {
     if (error instanceof SpaceProtocolError) {
@@ -114,6 +187,32 @@ export function createSpaceSyncApp(): Hono<{ Bindings: SpaceSyncEnv }> {
   });
 
   app.options("*", () => handleCorsPreflight(ANONYMOUS_CORS_HEADERS));
+
+  app.use("*", async (c, next) => {
+    if (c.req.method === "OPTIONS") return next();
+    const pathname = new URL(c.req.url).pathname;
+    const spacesRoot = "/v1/sync/spaces";
+    if (pathname !== spacesRoot && !pathname.startsWith(`${spacesRoot}/`)) {
+      return next();
+    }
+
+    const relativePath = pathname.slice(spacesRoot.length + 1);
+    const accountRequired = relativePath === "mine" || relativePath.startsWith("mine/");
+    const identity = await authenticateRequest(c.req.raw, c.env, accountRequired);
+    c.set("identity", identity);
+
+    const encodedSpaceId = relativePath.split("/")[0];
+    if (encodedSpaceId && encodedSpaceId !== "mine") {
+      let spaceId: string;
+      try {
+        spaceId = decodeURIComponent(encodedSpaceId);
+      } catch {
+        throw new SpaceProtocolError(400, "bad_request", "spaceId 编码无效");
+      }
+      await assertSpaceAccess(spaceId, identity, c.env);
+    }
+    return next();
+  });
 
   app.get("/health", async (c) => {
     if (!c.env.DB || !await createSpaceRepository(c.env.DB).checkHealth()) {
@@ -140,12 +239,17 @@ export function createSpaceSyncApp(): Hono<{ Bindings: SpaceSyncEnv }> {
   });
 
   app.post("/v1/sync/spaces", async (c) => {
+    if (c.get("identity").kind !== "anonymous") {
+      throw new SpaceProtocolError(403, "space_forbidden", "账户会话不能创建匿名空间");
+    }
     const body = await jsonBody(c);
     const spaceId = typeof body.spaceId === "string" ? body.spaceId.trim() : "";
     if (!spaceId) throw new SpaceProtocolError(400, "bad_request", "spaceId 不能为空");
     const createdAt = new Date().toISOString();
     const created = await createSpaceRepository(c.env.DB).createSpace({
       spaceId,
+      ownerKind: "anonymous",
+      ownerId: null,
       revision: INITIAL_SPACE_REVISION,
       epoch: 0,
       pendingUploadId: null,
@@ -154,6 +258,24 @@ export function createSpaceSyncApp(): Hono<{ Bindings: SpaceSyncEnv }> {
     });
     if (!created) throw new SpaceProtocolError(409, "space_exists", "空间已存在");
     return wrap(c.json({ ok: true, spaceId, revision: INITIAL_SPACE_REVISION, epoch: 0, createdAt }, 201));
+  });
+
+  app.get("/v1/sync/spaces/mine", async (c) => {
+    const identity = c.get("identity");
+    if (identity.kind !== "account") {
+      throw new SpaceProtocolError(401, "token_missing", "需要 Bearer 会话");
+    }
+    const createdAt = new Date().toISOString();
+    const space = await createSpaceRepository(c.env.DB).getOrCreateAccountSpace(
+      identity.accountId,
+      `space-${crypto.randomUUID()}`,
+      createdAt,
+    );
+    return wrap(c.json({
+      spaceId: space.spaceId,
+      revision: space.revision,
+      epoch: space.epoch,
+    }));
   });
 
   app.get("/v1/sync/spaces/:spaceId/check", async (c) => {

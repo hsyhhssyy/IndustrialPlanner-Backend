@@ -2,6 +2,8 @@
 name = "industrial-sync"
 main = "src/index.ts"
 compatibility_date = "2025-08-06"
+workers_dev = false
+preview_urls = false
 
 # D1 数据库：同步元数据
 [[d1_databases]]
@@ -25,6 +27,7 @@ D1_RETURN_THRESHOLD_BYTES = "552960"
 MAX_BATCH_D1_BLOB_BYTES = "8388608"
 MAX_R2_BLOB_BYTES = "26214400"
 UPLOAD_TTL_SECONDS = "900"
+ALLOW_ANONYMOUS_SPACES = "false"
 # LOCAL_DEV_HOST 仅通过 .dev.vars（本地）或 K8s 环境变量（Beta）注入
 # 不在此处设默认值，避免 wrangler dev 覆盖环境变量
 
@@ -42,6 +45,8 @@ ENVIRONMENT = "production"
 
 [env.beta]
 name = "industrial-sync-beta"
+workers_dev = false
+preview_urls = false
 
 [[env.beta.d1_databases]]
 binding = "DB"
@@ -62,6 +67,7 @@ D1_RETURN_THRESHOLD_BYTES = "552960"
 MAX_BATCH_D1_BLOB_BYTES = "8388608"
 MAX_R2_BLOB_BYTES = "26214400"
 UPLOAD_TTL_SECONDS = "900"
+ALLOW_ANONYMOUS_SPACES = "true"
 
 [env.beta.triggers]
 crons = ["*/5 * * * *"]

@@ -28,6 +28,7 @@ export interface FinalizeUploadInput {
 
 export interface SpaceRepository {
   createSpace(space: SpaceRow): Promise<boolean>;
+  getOrCreateAccountSpace(accountId: string, spaceId: string, createdAt: string): Promise<SpaceRow>;
   getSpace(spaceId: string): Promise<SpaceRow | null>;
   listAssets(spaceId: string): Promise<AssetRow[]>;
   getAsset(spaceId: string, assetType: string, assetId: string): Promise<AssetRow | null>;
@@ -78,6 +79,8 @@ function binary(value: unknown): ArrayBuffer | null {
 function mapSpace(row: Record<string, unknown>): SpaceRow {
   return {
     spaceId: row.space_id as string,
+    ownerKind: row.owner_kind as SpaceRow["ownerKind"],
+    ownerId: (row.owner_id as string | null) ?? null,
     revision: String(row.revision),
     epoch: row.epoch as number,
     pendingUploadId: (row.pending_upload_id as string | null) ?? null,
@@ -253,10 +256,33 @@ export function createSpaceRepository(db: D1Database): SpaceRepository {
     async createSpace(space) {
       const result = await db.prepare(
         `INSERT OR IGNORE INTO sync_spaces
-           (space_id, revision, epoch, pending_upload_id, lock_expires_at, updated_at)
-         VALUES (?1,?2,?3,NULL,NULL,?4)`,
-      ).bind(space.spaceId, space.revision, space.epoch, space.updatedAt).run();
+           (space_id, owner_kind, owner_id, revision, epoch,
+            pending_upload_id, lock_expires_at, updated_at)
+         VALUES (?1,?2,?3,?4,?5,NULL,NULL,?6)`,
+      ).bind(
+        space.spaceId,
+        space.ownerKind,
+        space.ownerId,
+        space.revision,
+        space.epoch,
+        space.updatedAt,
+      ).run();
       return (result.meta?.changes ?? 0) === 1;
+    },
+
+    async getOrCreateAccountSpace(accountId, spaceId, createdAt) {
+      await db.prepare(
+        `INSERT OR IGNORE INTO sync_spaces
+           (space_id, owner_kind, owner_id, revision, epoch,
+            pending_upload_id, lock_expires_at, updated_at)
+         VALUES (?1,'account',?2,?3,0,NULL,NULL,?4)`,
+      ).bind(spaceId, accountId, "0", createdAt).run();
+      const row = await db.prepare(
+        `SELECT * FROM sync_spaces
+         WHERE owner_kind='account' AND owner_id=?1`,
+      ).bind(accountId).first<Record<string, unknown>>();
+      if (!row) throw new Error("账户空间创建后不存在");
+      return mapSpace(row);
     },
 
     async getSpace(spaceId) {
