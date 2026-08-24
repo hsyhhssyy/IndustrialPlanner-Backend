@@ -9,6 +9,8 @@ import {
   verifyRequestJwt,
 } from "@industrial/shared";
 import {
+  ANONYMOUS_SPACE_ID_PREFIX,
+  ANONYMOUS_SPACE_TTL_MS,
   DEFAULT_D1_RETURN_THRESHOLD_BYTES,
   DEFAULT_MAX_BATCH_D1_BLOB_BYTES,
   DEFAULT_MAX_METADATA_SIZE,
@@ -18,6 +20,8 @@ import {
   DEFAULT_UPLOAD_TTL_SECONDS,
   INITIAL_SPACE_REVISION,
   SPACE_PROTOCOL_VERSION,
+  isAnonymousSpaceId,
+  isSpaceAvailableAt,
   isSpaceRevision,
   validatePrepareBatch,
   type StorageConfig,
@@ -27,6 +31,7 @@ import {
   SpaceProtocolError,
   cancelSpaceUpload,
   checkSpaceRevision,
+  cleanupExpiredSpaces,
   cleanupRecoverableBatches,
   commitSpaceUpload,
   downloadSpaceObject,
@@ -63,6 +68,8 @@ type RequestIdentity =
 interface SpaceSyncVariables {
   identity: RequestIdentity;
 }
+
+const SCHEDULED_MAINTENANCE_SLOT_MS = 5 * 60_000;
 
 function wrap(response: Response): Response {
   return withCors(response, ANONYMOUS_CORS_HEADERS);
@@ -128,8 +135,14 @@ async function assertSpaceAccess(
   identity: RequestIdentity,
   env: SpaceSyncEnv,
 ): Promise<void> {
+  if (identity.kind === "anonymous" && !isAnonymousSpaceId(spaceId)) {
+    throw new SpaceProtocolError(403, "space_forbidden", "该空间不允许匿名访问");
+  }
   const space = await createSpaceRepository(env.DB).getSpace(spaceId);
   if (!space) throw new SpaceProtocolError(404, "space_not_found", "空间不存在");
+  if (!isSpaceAvailableAt(space, Date.now())) {
+    throw new SpaceProtocolError(410, "space_expired", "临时空间已经过期");
+  }
   if (identity.kind === "anonymous") {
     if (space.ownerKind !== "anonymous") {
       throw new SpaceProtocolError(403, "space_forbidden", "无权访问账户空间");
@@ -149,12 +162,12 @@ function publicBaseUrl(request: Request, env: SpaceSyncEnv): string {
   return `${forwardedProto || url.protocol.replace(":", "")}://${forwardedHost || url.host}`;
 }
 
-function baseDeps(env: SpaceSyncEnv) {
+function baseDeps(env: SpaceSyncEnv, now = Date.now()) {
   return {
     repo: createSpaceRepository(env.DB),
     r2Bucket: env.BLOB_STORE,
     tokenSecret: tokenSecret(env),
-    now: Date.now(),
+    now,
   };
 }
 
@@ -227,6 +240,7 @@ export function createSpaceSyncApp(): Hono<{
       protocol: c.env.PROTOCOL_VERSION ?? SPACE_PROTOCOL_VERSION,
       concurrency: "exclusive-space-upload",
       uploadTtlSeconds: storage.uploadTtlSeconds,
+      anonymousSpaceTtlSeconds: ANONYMOUS_SPACE_TTL_MS / 1000,
       maxMutationsPerBatch: positiveInt(c.env.MAX_MUTATIONS_PER_BATCH, DEFAULT_MAX_MUTATIONS_PER_BATCH),
       maxMetadataSize: positiveInt(c.env.MAX_METADATA_SIZE, DEFAULT_MAX_METADATA_SIZE),
       supportedStorageModes: ["full"],
@@ -245,11 +259,23 @@ export function createSpaceSyncApp(): Hono<{
     const body = await jsonBody(c);
     const spaceId = typeof body.spaceId === "string" ? body.spaceId.trim() : "";
     if (!spaceId) throw new SpaceProtocolError(400, "bad_request", "spaceId 不能为空");
-    const createdAt = new Date().toISOString();
+    if (!isAnonymousSpaceId(spaceId)) {
+      throw new SpaceProtocolError(
+        403,
+        "space_forbidden",
+        `匿名 Space ID 必须以 ${ANONYMOUS_SPACE_ID_PREFIX} 开头`,
+      );
+    }
+    const createdAtMs = Date.now();
+    const createdAt = new Date(createdAtMs).toISOString();
+    const expiresAt = new Date(createdAtMs + ANONYMOUS_SPACE_TTL_MS).toISOString();
     const created = await createSpaceRepository(c.env.DB).createSpace({
       spaceId,
       ownerKind: "anonymous",
       ownerId: null,
+      lifecycleState: "active",
+      expiresAt,
+      cleanupLeaseExpiresAt: null,
       revision: INITIAL_SPACE_REVISION,
       epoch: 0,
       pendingUploadId: null,
@@ -257,7 +283,14 @@ export function createSpaceSyncApp(): Hono<{
       updatedAt: createdAt,
     });
     if (!created) throw new SpaceProtocolError(409, "space_exists", "空间已存在");
-    return wrap(c.json({ ok: true, spaceId, revision: INITIAL_SPACE_REVISION, epoch: 0, createdAt }, 201));
+    return wrap(c.json({
+      ok: true,
+      spaceId,
+      revision: INITIAL_SPACE_REVISION,
+      epoch: 0,
+      createdAt,
+      expiresAt,
+    }, 201));
   });
 
   app.get("/v1/sync/spaces/mine", async (c) => {
@@ -389,6 +422,16 @@ export function createSpaceSyncApp(): Hono<{
   return app;
 }
 
-export async function runScheduledCleanup(env: SpaceSyncEnv): Promise<number> {
-  return cleanupRecoverableBatches(baseDeps(env));
+export async function runScheduledCleanup(
+  env: SpaceSyncEnv,
+  scheduledTime = Date.now(),
+): Promise<number> {
+  const deps = baseDeps(env, scheduledTime);
+  const cleanupExpiredFirst = Math.floor(scheduledTime / SCHEDULED_MAINTENANCE_SLOT_MS) % 2 === 0;
+  if (cleanupExpiredFirst) {
+    const cleaned = await cleanupExpiredSpaces(deps);
+    return cleaned > 0 ? cleaned : cleanupRecoverableBatches(deps);
+  }
+  const recovered = await cleanupRecoverableBatches(deps);
+  return recovered > 0 ? recovered : cleanupExpiredSpaces(deps);
 }

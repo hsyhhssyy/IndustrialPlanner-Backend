@@ -12,6 +12,7 @@ import { signJwt } from "@industrial/shared";
 
 const SECRET = "space-revision-test-secret-with-32-bytes";
 const JWT_SECRET = "sync-test-jwt-secret-with-at-least-32-bytes";
+const ANONYMOUS_SPACE_PREFIX = "e2e-cf-";
 let proxy: PlatformProxy<{ DB: D1Database; BLOB_STORE: R2Bucket }>;
 let env: SpaceSyncEnv;
 
@@ -75,9 +76,16 @@ async function jsonRequest(pathname: string, body: Record<string, unknown>): Pro
   });
 }
 
-async function createSpace(spaceId: string): Promise<void> {
+async function createSpace(spaceId: string): Promise<{ createdAt: string; expiresAt: string }> {
   const response = await jsonRequest("/v1/sync/spaces", { spaceId });
   expect(response.status).toBe(201);
+  return response.json() as Promise<{ createdAt: string; expiresAt: string }>;
+}
+
+function nextEphemeralCleanupSlot(now = Date.now()): number {
+  const slotMs = 5 * 60_000;
+  const slot = Math.ceil(now / slotMs);
+  return (slot % 2 === 0 ? slot : slot + 1) * slotMs;
 }
 
 async function objectFor(
@@ -196,6 +204,27 @@ describe("cf-sync-v2 space revision 上传事务", () => {
     }
   });
 
+  it("migration 为现有 R2 key 原地建立 A/B 槽元数据与上传目标槽约束", async () => {
+    const assetColumns = await env.DB.prepare(
+      "SELECT name FROM pragma_table_info('sync_assets')",
+    ).all<{ name: string }>();
+    expect(assetColumns.results?.map((row) => row.name)).toEqual(expect.arrayContaining([
+      "r2_active_slot",
+      "r2_etag",
+      "r2_b_present",
+      "r2_b_blob_hash",
+      "r2_b_version",
+      "r2_b_etag",
+    ]));
+    const itemColumns = await env.DB.prepare(
+      "SELECT name FROM pragma_table_info('sync_upload_items')",
+    ).all<{ name: string }>();
+    expect(itemColumns.results?.map((row) => row.name)).toEqual(expect.arrayContaining([
+      "r2_primary_key",
+      "target_r2_slot",
+    ]));
+  });
+
   it("migration 在数据库层拒绝不一致的 space owner", async () => {
     const now = new Date().toISOString();
     await expect(env.DB.prepare(
@@ -205,6 +234,21 @@ describe("cf-sync-v2 space revision 上传事务", () => {
       "INSERT INTO sync_spaces (space_id, updated_at, owner_kind, owner_id) VALUES (?1, ?2, 'anonymous', ?3)",
     ).bind(`invalid-anonymous-${crypto.randomUUID()}`, now, "unexpected-owner").run()).rejects.toThrow(
       "invalid sync space owner",
+    );
+    await expect(env.DB.prepare(
+      `INSERT INTO sync_spaces
+         (space_id, updated_at, owner_kind, owner_id, expires_at)
+       VALUES (?1, ?2, 'account', ?3, ?4)`,
+    ).bind(
+      `invalid-account-expiry-${crypto.randomUUID()}`,
+      now,
+      `account-${crypto.randomUUID()}`,
+      new Date(Date.now() + 60_000).toISOString(),
+    ).run()).rejects.toThrow("invalid sync space lifecycle");
+    await expect(env.DB.prepare(
+      "INSERT INTO sync_spaces (space_id, updated_at, owner_kind, owner_id) VALUES (?1, ?2, 'anonymous', NULL)",
+    ).bind(`${ANONYMOUS_SPACE_PREFIX}missing-expiry-${crypto.randomUUID()}`, now).run()).rejects.toThrow(
+      "invalid sync space lifecycle",
     );
   });
 
@@ -237,7 +281,7 @@ describe("cf-sync-v2 space revision 上传事务", () => {
       createdAt: "2026-08-12T00:00:00.000Z",
       updatedAt: "2026-08-12T00:00:00.000Z",
     }, {
-      repo: {} as SpaceRepository,
+      repo: { listDeleteItems: async () => [] } as unknown as SpaceRepository,
       r2Bucket: env.BLOB_STORE,
       tokenSecret: SECRET,
       now: Date.now(),
@@ -305,7 +349,7 @@ describe("cf-sync-v2 space revision 上传事务", () => {
   });
 
   it("revision HTTP 合约拒绝数值类型并接受迁移后的十进制字符串", async () => {
-    const spaceId = `revision-contract-${crypto.randomUUID()}`;
+    const spaceId = `${ANONYMOUS_SPACE_PREFIX}revision-contract-${crypto.randomUUID()}`;
     await createSpace(spaceId);
     const bytes = new TextEncoder().encode("string-revision");
     const object = await objectFor(bytes, "blueprint", "contract", "m-contract");
@@ -325,7 +369,7 @@ describe("cf-sync-v2 space revision 上传事务", () => {
   });
 
   it("同一 base revision 并发 prepare 只有一个取得整个 space 的锁", async () => {
-    const spaceId = `concurrent-${crypto.randomUUID()}`;
+    const spaceId = `${ANONYMOUS_SPACE_PREFIX}concurrent-${crypto.randomUUID()}`;
     await createSpace(spaceId);
     const bytes = new TextEncoder().encode("concurrent");
     const object = await objectFor(bytes, "blueprint", "a", "m-a");
@@ -339,7 +383,7 @@ describe("cf-sync-v2 space revision 上传事务", () => {
   });
 
   it("一个批次并行上传多个对象，commit 只推进一次 revision/epoch", async () => {
-    const spaceId = `batch-${crypto.randomUUID()}`;
+    const spaceId = `${ANONYMOUS_SPACE_PREFIX}batch-${crypto.randomUUID()}`;
     await createSpace(spaceId);
     const firstBytes = new TextEncoder().encode("first-object");
     const secondBytes = new TextEncoder().encode("second-object");
@@ -357,8 +401,9 @@ describe("cf-sync-v2 space revision 上传事务", () => {
     );
 
     const lockedPlan = await request(`/v1/sync/spaces/${spaceId}/plan`);
-    expect(lockedPlan.status).toBe(423);
-    expect(await lockedPlan.json()).toMatchObject({ error: "space_locked" });
+    expect(lockedPlan.status).toBe(200);
+    expect(await lockedPlan.json()).toMatchObject({ revision: "0", epoch: 0, assets: [] });
+    expect((await request(`/v1/sync/spaces/${spaceId}/check?knownRevision=0`)).status).toBe(204);
 
     const uploads = await uploadAll(prepared, new Map([
       ["blueprint/first", firstBytes],
@@ -399,7 +444,7 @@ describe("cf-sync-v2 space revision 上传事务", () => {
   });
 
   it("相同 clientBatchId 的 prepare 重试返回同一个 uploadId", async () => {
-    const spaceId = `idempotent-${crypto.randomUUID()}`;
+    const spaceId = `${ANONYMOUS_SPACE_PREFIX}idempotent-${crypto.randomUUID()}`;
     await createSpace(spaceId);
     const bytes = new TextEncoder().encode("same-plan");
     const object = await objectFor(bytes, "blueprint", "same", "m-same");
@@ -410,7 +455,7 @@ describe("cf-sync-v2 space revision 上传事务", () => {
   });
 
   it("commit 拒绝尚未全部完成的对象", async () => {
-    const spaceId = `incomplete-${crypto.randomUUID()}`;
+    const spaceId = `${ANONYMOUS_SPACE_PREFIX}incomplete-${crypto.randomUUID()}`;
     await createSpace(spaceId);
     const bytes = new TextEncoder().encode("not-uploaded");
     const object = await objectFor(bytes, "blueprint", "missing", "m-missing");
@@ -421,7 +466,7 @@ describe("cf-sync-v2 space revision 上传事务", () => {
   });
 
   it("cancel 清理暂存并释放 space 锁，不推进 revision/epoch", async () => {
-    const spaceId = `cancel-${crypto.randomUUID()}`;
+    const spaceId = `${ANONYMOUS_SPACE_PREFIX}cancel-${crypto.randomUUID()}`;
     await createSpace(spaceId);
     const bytes = new TextEncoder().encode("cancel-me");
     const object = await objectFor(bytes, "blueprint", "cancelled", "m-cancel");
@@ -441,7 +486,7 @@ describe("cf-sync-v2 space revision 上传事务", () => {
   });
 
   it("15 分钟过期批次由清理器释放，旧 base revision 可以重新 prepare", async () => {
-    const spaceId = `expire-${crypto.randomUUID()}`;
+    const spaceId = `${ANONYMOUS_SPACE_PREFIX}expire-${crypto.randomUUID()}`;
     await createSpace(spaceId);
     const bytes = new TextEncoder().encode("expires");
     const object = await objectFor(bytes, "blueprint", "expired", "m-expired");
@@ -458,8 +503,8 @@ describe("cf-sync-v2 space revision 上传事务", () => {
     expect(retry.status).toBe(200);
   });
 
-  it("大对象通过 R2 固定 key 提交，full 模式连续提交由 epoch 表达顺序", async () => {
-    const spaceId = `r2-${crypto.randomUUID()}`;
+  it("大对象在 R2 A/B 槽间交替，连续提交始终最多保留两个完成态对象", async () => {
+    const spaceId = `${ANONYMOUS_SPACE_PREFIX}r2-${crypto.randomUUID()}`;
     await createSpace(spaceId);
     const firstBytes = new Uint8Array(614_400);
     firstBytes.fill(7);
@@ -482,11 +527,89 @@ describe("cf-sync-v2 space revision 上传事务", () => {
     ).bind(spaceId).all<{ r2_key: string }>();
     expect(rows.results).toHaveLength(1);
     expect((await env.BLOB_STORE.list({ prefix: `sync/v3/spaces/${encodeURIComponent(spaceId)}/` })).objects)
-      .toHaveLength(1);
-  });
+      .toHaveLength(2);
 
-  it("资产切回 D1 后删除仍清除固定 R2 对象，并在同一 commit 发布新 revision", async () => {
-    const spaceId = `delete-${crypto.randomUUID()}`;
+    const asset = await createSpaceRepository(env.DB).getAsset(spaceId, "blueprint", "large");
+    expect(asset).toMatchObject({ activeBackend: "r2", r2ActiveSlot: "b", r2Present: true, r2BPresent: true });
+
+    const thirdBytes = new Uint8Array(614_402).fill(11);
+    const thirdObject = await objectFor(thirdBytes, "blueprint", "large", "m-large-3");
+    const third = await (await prepare(spaceId, second.targetRevision, "large-3", [thirdObject])).json() as
+      Record<string, any>;
+    expect((await uploadAll(third, new Map([["blueprint/large", thirdBytes]])))[0]?.status).toBe(200);
+    expect((await commit(spaceId, third)).status).toBe(200);
+    expect((await createSpaceRepository(env.DB).getAsset(spaceId, "blueprint", "large"))?.r2ActiveSlot).toBe("a");
+    expect((await env.BLOB_STORE.list({ prefix: `sync/v3/spaces/${encodeURIComponent(spaceId)}/` })).objects)
+      .toHaveLength(2);
+  }, 20_000);
+
+  it("R2 inactive 槽完成但 finalize 失败时继续提供旧 revision，恢复后原子切换新槽", async () => {
+    const spaceId = `${ANONYMOUS_SPACE_PREFIX}r2-readable-${crypto.randomUUID()}`;
+    await createSpace(spaceId);
+    const oldBytes = new Uint8Array(614_400).fill(0x21);
+    const oldObject = await objectFor(oldBytes, "blueprint", "readable", "m-readable-old");
+    const first = await (await prepare(spaceId, "0", "readable-old", [oldObject])).json() as Record<string, any>;
+    expect((await uploadAll(first, new Map([["blueprint/readable", oldBytes]])))[0]?.status).toBe(200);
+    expect((await commit(spaceId, first)).status).toBe(200);
+
+    const newBytes = new Uint8Array(614_401).fill(0x42);
+    const newObject = await objectFor(newBytes, "blueprint", "readable", "m-readable-new");
+    const second = await (await prepare(
+      spaceId,
+      first.targetRevision,
+      "readable-new",
+      [newObject],
+    )).json() as Record<string, any>;
+    expect((await uploadAll(second, new Map([["blueprint/readable", newBytes]])))[0]?.status).toBe(200);
+
+    const preparedPlan = await (await request(`/v1/sync/spaces/${spaceId}/plan`)).json() as Record<string, any>;
+    expect(preparedPlan.revision).toBe(first.targetRevision);
+    const preparedDownload = await worker.fetch(new Request(preparedPlan.assets[0].downloadUrl), env);
+    expect(new Uint8Array(await preparedDownload.arrayBuffer())).toEqual(oldBytes);
+
+    const repository = createSpaceRepository(env.DB);
+    await repository.beginCommit(second.uploadId, new Date().toISOString());
+    const committing = (await repository.getBatch(second.uploadId))!;
+    const abortingCommit = await request(`/v1/sync/spaces/${spaceId}/transaction/abort`, { method: "POST" });
+    expect(abortingCommit.status).toBe(409);
+    expect(await abortingCommit.json()).toMatchObject({ error: "commit_in_progress" });
+    expect((await repository.getBatch(second.uploadId))?.state).toBe("committing");
+    const failingRepository: SpaceRepository = {
+      ...repository,
+      finalizeCommit: async () => {
+        throw new Error("injected R2 finalize failure");
+      },
+    };
+    await expect(recoverBatch(committing, {
+      repo: failingRepository,
+      r2Bucket: env.BLOB_STORE,
+      tokenSecret: SECRET,
+      now: Date.now(),
+    })).rejects.toThrow("injected R2 finalize failure");
+
+    const failedPlan = await (await request(`/v1/sync/spaces/${spaceId}/plan`)).json() as Record<string, any>;
+    expect(failedPlan.revision).toBe(first.targetRevision);
+    const failedDownload = await worker.fetch(new Request(failedPlan.assets[0].downloadUrl), env);
+    expect(failedDownload.status).toBe(200);
+    expect(new Uint8Array(await failedDownload.arrayBuffer())).toEqual(oldBytes);
+    expect((await env.BLOB_STORE.list({ prefix: `sync/v3/spaces/${encodeURIComponent(spaceId)}/` })).objects)
+      .toHaveLength(2);
+
+    expect(await recoverBatch((await repository.getBatch(second.uploadId))!, {
+      repo: repository,
+      r2Bucket: env.BLOB_STORE,
+      tokenSecret: SECRET,
+      now: Date.now(),
+    })).toMatchObject({ revision: second.targetRevision, epoch: 2 });
+    const committedPlan = await (await request(`/v1/sync/spaces/${spaceId}/plan`)).json() as Record<string, any>;
+    expect(committedPlan.revision).toBe(second.targetRevision);
+    const committedDownload = await worker.fetch(new Request(committedPlan.assets[0].downloadUrl), env);
+    expect(new Uint8Array(await committedDownload.arrayBuffer())).toEqual(newBytes);
+    expect((await repository.getAsset(spaceId, "blueprint", "readable"))?.r2ActiveSlot).toBe("b");
+  }, 20_000);
+
+  it("资产切回 D1 后删除仍清除 R2 双槽，并在同一 commit 发布新 revision", async () => {
+    const spaceId = `${ANONYMOUS_SPACE_PREFIX}delete-${crypto.randomUUID()}`;
     await createSpace(spaceId);
     const largeBytes = new Uint8Array(614_400).fill(0x31);
     const largeObject = await objectFor(largeBytes, "blueprint", "deleted", "m-large");
@@ -494,18 +617,42 @@ describe("cf-sync-v2 space revision 上传事务", () => {
     expect((await uploadAll(large, new Map([["blueprint/deleted", largeBytes]])))[0]?.status).toBe(200);
     expect((await commit(spaceId, large)).status).toBe(200);
 
+    const secondLargeBytes = new Uint8Array(614_401).fill(0x32);
+    const secondLargeObject = await objectFor(secondLargeBytes, "blueprint", "deleted", "m-large-2");
+    const secondLarge = await (await prepare(
+      spaceId,
+      large.targetRevision,
+      "large-2",
+      [secondLargeObject],
+    )).json() as Record<string, any>;
+    expect((await uploadAll(secondLarge, new Map([["blueprint/deleted", secondLargeBytes]])))[0]?.status).toBe(200);
+    expect((await commit(spaceId, secondLarge)).status).toBe(200);
+
     const smallBytes = new TextEncoder().encode("active-d1-but-r2-retained");
     const smallObject = await objectFor(smallBytes, "blueprint", "deleted", "m-small");
-    const small = await (await prepare(spaceId, large.targetRevision, "small", [smallObject])).json() as Record<string, any>;
+    const small = await (await prepare(
+      spaceId,
+      secondLarge.targetRevision,
+      "small",
+      [smallObject],
+    )).json() as Record<string, any>;
     expect(small.uploads[0]).toMatchObject({ backend: "d1" });
     expect((await uploadAll(small, new Map([["blueprint/deleted", smallBytes]])))[0]?.status).toBe(200);
     expect((await commit(spaceId, small)).status).toBe(200);
 
     const row = await env.DB.prepare(
-      "SELECT active_backend,r2_present,r2_key FROM sync_assets WHERE space_id=?1 AND asset_type='blueprint' AND asset_id='deleted'",
-    ).bind(spaceId).first<{ active_backend: string; r2_present: number; r2_key: string }>();
-    expect(row).toMatchObject({ active_backend: "d1", r2_present: 1 });
+      `SELECT active_backend,r2_present,r2_key,r2_b_present
+       FROM sync_assets
+       WHERE space_id=?1 AND asset_type='blueprint' AND asset_id='deleted'`,
+    ).bind(spaceId).first<{
+      active_backend: string;
+      r2_present: number;
+      r2_key: string;
+      r2_b_present: number;
+    }>();
+    expect(row).toMatchObject({ active_backend: "d1", r2_present: 1, r2_b_present: 1 });
     expect(await env.BLOB_STORE.head(row!.r2_key)).not.toBeNull();
+    expect(await env.BLOB_STORE.head(`${row!.r2_key}.b`)).not.toBeNull();
 
     const deletion = await prepare(spaceId, small.targetRevision, "delete", [], [{
       clientMutationId: "m-delete",
@@ -519,18 +666,19 @@ describe("cf-sync-v2 space revision 上传事务", () => {
     expect(deleted).toMatchObject({
       status: "committed",
       revision: prepared.targetRevision,
-      epoch: 3,
+      epoch: 4,
       assets: [],
       deletedAssets: [{ assetType: "blueprint", assetId: "deleted" }],
     });
 
     expect(await env.BLOB_STORE.head(row!.r2_key)).toBeNull();
+    expect(await env.BLOB_STORE.head(`${row!.r2_key}.b`)).toBeNull();
     expect(await env.DB.prepare(
       "SELECT 1 AS present FROM sync_assets WHERE space_id=?1 AND asset_type='blueprint' AND asset_id='deleted'",
     ).bind(spaceId).first()).toBeNull();
     expect(await (await request(`/v1/sync/spaces/${spaceId}/plan`)).json()).toMatchObject({
       revision: prepared.targetRevision,
-      epoch: 3,
+      epoch: 4,
       assets: [],
     });
     expect(await (await commit(spaceId, prepared)).json()).toMatchObject({
@@ -538,10 +686,10 @@ describe("cf-sync-v2 space revision 上传事务", () => {
       revision: prepared.targetRevision,
       deletedAssets: [{ assetType: "blueprint", assetId: "deleted" }],
     });
-  });
+  }, 20_000);
 
-  it("R2 删除后 D1 finalize 失败时保持 space 锁并由 recovery 向前完成", async () => {
-    const spaceId = `delete-recovery-${crypto.randomUUID()}`;
+  it("删除 finalize 失败时旧 revision 与 R2 对象仍可读，recovery 发布后再清理", async () => {
+    const spaceId = `${ANONYMOUS_SPACE_PREFIX}delete-recovery-${crypto.randomUUID()}`;
     await createSpace(spaceId);
     const bytes = new Uint8Array(614_400).fill(0x52);
     const object = await objectFor(bytes, "blueprint", "recover-delete", "m-create");
@@ -573,9 +721,15 @@ describe("cf-sync-v2 space revision 上传事务", () => {
       tokenSecret: SECRET,
       now: Date.now(),
     })).rejects.toThrow("injected D1 finalize failure");
-    expect(await env.BLOB_STORE.head(asset!.r2Key)).toBeNull();
+    expect(await env.BLOB_STORE.head(asset!.r2Key)).not.toBeNull();
     expect((await repository.getSpace(spaceId))?.pendingUploadId).toBe(prepared.uploadId);
-    expect((await repository.listDeleteItems(prepared.uploadId))[0]?.state).toBe("deleted");
+    expect((await repository.listDeleteItems(prepared.uploadId))[0]?.state).toBe("reserved");
+    const readablePlan = await (await request(`/v1/sync/spaces/${spaceId}/plan`)).json() as Record<string, any>;
+    expect(readablePlan).toMatchObject({ revision: created.targetRevision, epoch: 1 });
+    expect(readablePlan.assets).toHaveLength(1);
+    const oldDownload = await worker.fetch(new Request(readablePlan.assets[0].downloadUrl), env);
+    expect(oldDownload.status).toBe(200);
+    expect(new Uint8Array(await oldDownload.arrayBuffer())).toEqual(bytes);
 
     const recovered = await recoverBatch((await repository.getBatch(prepared.uploadId))!, {
       repo: repository,
@@ -589,10 +743,67 @@ describe("cf-sync-v2 space revision 上传事务", () => {
       epoch: 2,
       assets: [],
     });
-  });
+    expect(await env.BLOB_STORE.head(asset!.r2Key)).toBeNull();
+  }, 20_000);
+
+  it("删除 revision 已发布但 R2 清理失败时保留清理任务，重试后回收对象", async () => {
+    const spaceId = `${ANONYMOUS_SPACE_PREFIX}delete-cleanup-${crypto.randomUUID()}`;
+    await createSpace(spaceId);
+    const bytes = new Uint8Array(614_400).fill(0x61);
+    const object = await objectFor(bytes, "blueprint", "cleanup", "m-cleanup-create");
+    const created = await (await prepare(spaceId, "0", "cleanup-create", [object])).json() as Record<string, any>;
+    expect((await uploadAll(created, new Map([["blueprint/cleanup", bytes]])))[0]?.status).toBe(200);
+    expect((await commit(spaceId, created)).status).toBe(200);
+
+    const prepared = await (await prepare(spaceId, created.targetRevision, "cleanup-delete", [], [{
+      clientMutationId: "m-cleanup-delete",
+      assetType: "blueprint",
+      assetId: "cleanup",
+    }])).json() as Record<string, any>;
+    const repository = createSpaceRepository(env.DB);
+    const asset = (await repository.getAsset(spaceId, "blueprint", "cleanup"))!;
+    await repository.beginCommit(prepared.uploadId, new Date().toISOString());
+    const deleteFailingBucket = new Proxy(env.BLOB_STORE, {
+      get(target, property) {
+        if (property === "delete") {
+          return async () => {
+            throw new Error("injected R2 delete failure");
+          };
+        }
+        const value = Reflect.get(target, property, target) as unknown;
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }) as R2Bucket;
+
+    expect(await recoverBatch((await repository.getBatch(prepared.uploadId))!, {
+      repo: repository,
+      r2Bucket: deleteFailingBucket,
+      tokenSecret: SECRET,
+      now: Date.now(),
+    })).toMatchObject({ revision: prepared.targetRevision, epoch: 2 });
+    expect(await (await request(`/v1/sync/spaces/${spaceId}/plan`)).json()).toMatchObject({
+      revision: prepared.targetRevision,
+      epoch: 2,
+      assets: [],
+    });
+    expect(await env.BLOB_STORE.head(asset.r2Key)).not.toBeNull();
+    expect((await repository.listDeleteItems(prepared.uploadId))[0]?.state).toBe("committed");
+    expect(await repository.listPendingDeleteCleanupBatches(8)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ uploadId: prepared.uploadId }),
+    ]));
+
+    expect(await recoverBatch((await repository.getBatch(prepared.uploadId))!, {
+      repo: repository,
+      r2Bucket: env.BLOB_STORE,
+      tokenSecret: SECRET,
+      now: Date.now(),
+    })).toMatchObject({ revision: prepared.targetRevision, epoch: 2 });
+    expect(await env.BLOB_STORE.head(asset.r2Key)).toBeNull();
+    expect((await repository.listDeleteItems(prepared.uploadId))[0]?.state).toBe("deleted");
+  }, 20_000);
 
   it("prepare 拒绝空变更集、重复资产和不存在的删除目标", async () => {
-    const spaceId = `delete-validation-${crypto.randomUUID()}`;
+    const spaceId = `${ANONYMOUS_SPACE_PREFIX}delete-validation-${crypto.randomUUID()}`;
     await createSpace(spaceId);
     const empty = await prepare(spaceId, "0", "empty", []);
     expect(empty.status).toBe(400);
@@ -635,14 +846,40 @@ describe("sync 双环境空间归属与防绕过门禁", () => {
     return request(pathname, { ...init, headers });
   }
 
-  it("beta 匿名空间与账户空间严格分离，同一账户幂等取得同一空间", async () => {
+  it("beta 只允许 e2e-cf- 空间匿名创建和访问，并与账户空间严格分离", async () => {
     const previousFlag = env.ALLOW_ANONYMOUS_SPACES;
     const previousSecret = env.JWT_SECRET;
     env.ALLOW_ANONYMOUS_SPACES = "true";
     env.JWT_SECRET = JWT_SECRET;
     try {
-      const anonymousSpaceId = `anonymous-owner-${crypto.randomUUID()}`;
-      await createSpace(anonymousSpaceId);
+      const forbiddenAnonymousSpaceId = `anonymous-owner-${crypto.randomUUID()}`;
+      const forbiddenCreate = await jsonRequest("/v1/sync/spaces", {
+        spaceId: forbiddenAnonymousSpaceId,
+      });
+      expect(forbiddenCreate.status).toBe(403);
+      expect(await forbiddenCreate.json()).toMatchObject({ error: "space_forbidden" });
+      expect(await createSpaceRepository(env.DB).getSpace(forbiddenAnonymousSpaceId)).toBeNull();
+
+      const legacyAnonymousSpaceId = `legacy-anonymous-${crypto.randomUUID()}`;
+      expect(await createSpaceRepository(env.DB).createSpace({
+        spaceId: legacyAnonymousSpaceId,
+        ownerKind: "anonymous",
+        ownerId: null,
+        lifecycleState: "active",
+        expiresAt: null,
+        cleanupLeaseExpiresAt: null,
+        revision: "0",
+        epoch: 0,
+        pendingUploadId: null,
+        lockExpiresAt: null,
+        updatedAt: new Date().toISOString(),
+      })).toBe(true);
+      expect((await request(`/v1/sync/spaces/${legacyAnonymousSpaceId}/plan`)).status).toBe(403);
+
+      const anonymousSpaceId = `${ANONYMOUS_SPACE_PREFIX}anonymous-owner-${crypto.randomUUID()}`;
+      const created = await createSpace(anonymousSpaceId);
+      expect(Date.parse(created.expiresAt) - Date.parse(created.createdAt)).toBe(60 * 60_000);
+      expect((await request(`/v1/sync/spaces/${anonymousSpaceId}/plan`)).status).toBe(200);
 
       const ownerToken = await accountToken("owner-account");
       const firstMine = await authenticatedRequest("/v1/sync/spaces/mine", ownerToken);
@@ -692,6 +929,89 @@ describe("sync 双环境空间归属与防绕过门禁", () => {
     }
   });
 
+  it("e2e-cf- 空间一小时后立即不可访问，Cron 每轮至多清理八条并最终删除 D1/R2", async () => {
+    const spaceId = `${ANONYMOUS_SPACE_PREFIX}expiry-${crypto.randomUUID()}`;
+    await createSpace(spaceId);
+
+    const bodies = new Map<string, Uint8Array>();
+    const objects: Awaited<ReturnType<typeof objectFor>>[] = [];
+    for (let index = 0; index < 9; index += 1) {
+      const assetId = `asset-${String(index).padStart(2, "0")}`;
+      const bytes = index === 8
+        ? new Uint8Array(700 * 1024).fill(8)
+        : new TextEncoder().encode(`temporary-${index}`);
+      bodies.set(`blueprint/${assetId}`, bytes);
+      objects.push(await objectFor(bytes, "blueprint", assetId, `m-${index}`));
+    }
+
+    const prepared = await (await prepare(spaceId, "0", "expiry-batch", objects)).json() as Record<string, any>;
+    const uploads = await uploadAll(prepared, bodies);
+    expect(uploads.every((response) => response.status === 200)).toBe(true);
+    expect((await commit(spaceId, prepared)).status).toBe(200);
+    const r2Asset = await createSpaceRepository(env.DB).getAsset(spaceId, "blueprint", "asset-08");
+    expect(r2Asset?.activeBackend).toBe("r2");
+    expect(await env.BLOB_STORE.head(r2Asset!.r2Key)).not.toBeNull();
+
+    await env.DB.prepare(
+      "UPDATE sync_spaces SET expires_at=?2 WHERE space_id=?1",
+    ).bind(spaceId, new Date(Date.now() - 1).toISOString()).run();
+    const expired = await request(`/v1/sync/spaces/${spaceId}/plan`);
+    expect(expired.status).toBe(410);
+    expect(await expired.json()).toMatchObject({ error: "space_expired" });
+
+    const scheduledTime = nextEphemeralCleanupSlot();
+    expect(await runScheduledCleanup(env, scheduledTime)).toBe(1);
+    expect((await env.DB.prepare(
+      "SELECT COUNT(*) AS cnt FROM sync_upload_items WHERE space_id=?1",
+    ).bind(spaceId).first<{ cnt: number }>())?.cnt).toBe(1);
+    expect((await createSpaceRepository(env.DB).getSpace(spaceId))?.lifecycleState).toBe("deleting");
+
+    for (let iteration = 0; iteration < 8; iteration += 1) {
+      if (!await createSpaceRepository(env.DB).getSpace(spaceId)) break;
+      await runScheduledCleanup(env, scheduledTime);
+    }
+    expect(await createSpaceRepository(env.DB).getSpace(spaceId)).toBeNull();
+    expect(await env.BLOB_STORE.head(r2Asset!.r2Key)).toBeNull();
+    for (const table of ["sync_upload_items", "sync_delete_items", "sync_assets", "sync_upload_batches"]) {
+      expect((await env.DB.prepare(
+        `SELECT COUNT(*) AS cnt FROM ${table} WHERE space_id=?1`,
+      ).bind(spaceId).first<{ cnt: number }>())?.cnt).toBe(0);
+    }
+  });
+
+  it("到期清理等待仍在 PUT lease 内的上传项，lease 结束后可以重试", async () => {
+    const spaceId = `${ANONYMOUS_SPACE_PREFIX}live-upload-${crypto.randomUUID()}`;
+    await createSpace(spaceId);
+    const bytes = new TextEncoder().encode("live-upload");
+    const object = await objectFor(bytes, "blueprint", "live", "m-live");
+    const prepared = await (await prepare(spaceId, "0", "live-upload", [object])).json() as Record<string, any>;
+    const now = Date.now();
+    const firstCleanupTime = nextEphemeralCleanupSlot(now);
+    const leaseExpiresAt = new Date(firstCleanupTime + 60_000).toISOString();
+    await env.DB.batch([
+      env.DB.prepare(
+        `UPDATE sync_upload_items
+         SET state='uploading',lease_expires_at=?2
+         WHERE upload_id=?1`,
+      ).bind(prepared.uploadId, leaseExpiresAt),
+      env.DB.prepare(
+        "UPDATE sync_spaces SET expires_at=?2 WHERE space_id=?1",
+      ).bind(spaceId, new Date(firstCleanupTime - 1).toISOString()),
+    ]);
+
+    expect(await runScheduledCleanup(env, firstCleanupTime)).toBe(1);
+    expect((await env.DB.prepare(
+      "SELECT COUNT(*) AS cnt FROM sync_upload_items WHERE space_id=?1",
+    ).bind(spaceId).first<{ cnt: number }>())?.cnt).toBe(1);
+
+    const afterLease = firstCleanupTime + 10 * 60_000;
+    for (let iteration = 0; iteration < 6; iteration += 1) {
+      if (!await createSpaceRepository(env.DB).getSpace(spaceId)) break;
+      await runScheduledCleanup(env, afterLease);
+    }
+    expect(await createSpaceRepository(env.DB).getSpace(spaceId)).toBeNull();
+  });
+
   it("stable 仅保留匿名 capabilities，账户空间持合法会话可用", async () => {
     const previousFlag = env.ALLOW_ANONYMOUS_SPACES;
     const previousSecret = env.JWT_SECRET;
@@ -700,7 +1020,7 @@ describe("sync 双环境空间归属与防绕过门禁", () => {
     try {
       expect((await request("/v1/sync/capabilities")).status).toBe(200);
       const anonymousCreate = await jsonRequest("/v1/sync/spaces", {
-        spaceId: `stable-anonymous-${crypto.randomUUID()}`,
+        spaceId: `${ANONYMOUS_SPACE_PREFIX}stable-anonymous-${crypto.randomUUID()}`,
       });
       expect(anonymousCreate.status).toBe(401);
 

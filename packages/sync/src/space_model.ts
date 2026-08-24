@@ -7,6 +7,8 @@
 
 export const SPACE_PROTOCOL_VERSION = "cf-sync-v2";
 export const INITIAL_SPACE_REVISION = "0";
+export const ANONYMOUS_SPACE_ID_PREFIX = "e2e-cf-";
+export const ANONYMOUS_SPACE_TTL_MS = 60 * 60 * 1000;
 export const DEFAULT_UPLOAD_TTL_SECONDS = 15 * 60;
 export const DEFAULT_MAX_MUTATIONS_PER_BATCH = 32;
 export const DEFAULT_MAX_METADATA_SIZE = 256 * 1024;
@@ -18,7 +20,9 @@ export const DEFAULT_MAX_BATCH_D1_BLOB_BYTES = 8 * 1024 * 1024;
 export const DEFAULT_MAX_R2_BLOB_BYTES = 25 * 1024 * 1024;
 
 export type StorageBackend = "d1" | "r2";
+export type R2Slot = "a" | "b";
 export type SpaceOwnerKind = "anonymous" | "account";
+export type SpaceLifecycleState = "active" | "deleting";
 export type SpaceRevision = string;
 export type UploadBatchState =
   | "prepared"
@@ -34,10 +38,25 @@ export type UploadItemState =
   | "committed"
   | "cancelled";
 
+// Beta 只为无需登录的前端 E2E 测试保留匿名 Space 命名空间。
+export function isAnonymousSpaceId(spaceId: string): boolean {
+  return spaceId.startsWith(ANONYMOUS_SPACE_ID_PREFIX);
+}
+
+export function isSpaceAvailableAt(space: SpaceRow, now: number): boolean {
+  if (space.lifecycleState !== "active") return false;
+  if (space.expiresAt === null) return true;
+  const expiresAt = Date.parse(space.expiresAt);
+  return Number.isFinite(expiresAt) && expiresAt > now;
+}
+
 export interface SpaceRow {
   spaceId: string;
   ownerKind: SpaceOwnerKind;
   ownerId: string | null;
+  lifecycleState: SpaceLifecycleState;
+  expiresAt: string | null;
+  cleanupLeaseExpiresAt: string | null;
   revision: SpaceRevision;
   epoch: number;
   pendingUploadId: string | null;
@@ -70,6 +89,14 @@ export interface AssetRow {
   r2ByteSize: number | null;
   r2Encoding: string | null;
   r2Version: string | null;
+  r2Etag: string | null;
+  r2ActiveSlot: R2Slot;
+  r2BPresent: boolean;
+  r2BBlobHash: string | null;
+  r2BByteSize: number | null;
+  r2BEncoding: string | null;
+  r2BVersion: string | null;
+  r2BEtag: string | null;
   committedAt: string;
 }
 
@@ -97,6 +124,7 @@ export interface DeleteItemRow extends PrepareDeletion {
   uploadId: string;
   spaceId: string;
   objectKey: string;
+  objectKeyB: string;
   state: "issued" | "reserved" | "deleted" | "committed" | "cancelled";
   createdAt: string;
   updatedAt: string;
@@ -123,6 +151,8 @@ export interface UploadItemRow extends PrepareObject {
   spaceId: string;
   sourceBackend: StorageBackend;
   targetBackend: StorageBackend;
+  r2PrimaryKey: string;
+  targetR2Slot: R2Slot | null;
   objectKey: string;
   r2MultipartUploadId: string | null;
   partEtag: string | null;
@@ -271,6 +301,14 @@ export function deriveFixedR2Key(
   assetId: string,
 ): string {
   return `sync/v3/spaces/${encodeURIComponent(spaceId)}/assets/${encodeURIComponent(assetType)}/${encodeURIComponent(assetId)}/payload`;
+}
+
+export function deriveR2SlotKey(primaryKey: string, slot: R2Slot): string {
+  return slot === "a" ? primaryKey : `${primaryKey}.b`;
+}
+
+export function inactiveR2Slot(activeSlot: R2Slot): R2Slot {
+  return activeSlot === "a" ? "b" : "a";
 }
 
 export function validatePrepareObjects(

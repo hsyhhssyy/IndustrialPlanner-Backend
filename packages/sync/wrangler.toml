@@ -13,6 +13,7 @@ database_id = "34197a80-811a-4e06-bbc8-c633b8db1044"
 
 # R2 存储：不可变 payload
 # AI-CORRECTION 2026-08-08: RQ-007 改为每资产固定 key 的最新态覆盖，不再按 hash 永久新增。
+# AI-CORRECTION 2026-08-24: 每资产固定身份下使用有界 A/B 两个完成态 key；更新写非活动槽，不再覆盖已发布槽。
 [[r2_buckets]]
 binding = "BLOB_STORE"
 bucket_name = "industrial-sync-blobs"

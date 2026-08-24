@@ -19,6 +19,10 @@ const CLIENT_SECRET = "test-client-secret";
 const REDIRECT_URI = "https://backend.test/v1/oauth/callback";
 const FRONTEND_REDIRECT_URI = "https://frontend.test/oauth/callback";
 const SECOND_FRONTEND_REDIRECT_URI = "https://preview.test/oauth/callback";
+const LOOPBACK_FRONTEND_REDIRECT_URIS = [
+  "http://localhost:4174/auth/callback",
+  "http://127.0.0.1:4174/auth/callback",
+] as const;
 const OAUTH_CHANNEL = "oauth-channel-0123456789abcdef";
 const INTERNAL_SECRET = "oauth-test-internal-secret-with-at-least-32-bytes";
 
@@ -224,6 +228,7 @@ beforeAll(async () => {
     OAUTH_FRONTEND_REDIRECT_URIS: JSON.stringify([
       FRONTEND_REDIRECT_URI,
       SECOND_FRONTEND_REDIRECT_URI,
+      ...LOOPBACK_FRONTEND_REDIRECT_URIS,
     ]),
     INTERNAL_SERVICE_SECRET: INTERNAL_SECRET,
     OAUTH_CALLBACK_CODE_TTL_SECONDS: "60",
@@ -305,6 +310,19 @@ describe("OIDC 登录闭环", () => {
     expect(fragment.get("code")).not.toBe("");
   });
 
+  it.each(LOOPBACK_FRONTEND_REDIRECT_URIS)(
+    "允许 Beta E2E 使用精确登记的 loopback HTTP callback：%s",
+    async (frontendRedirectUri) => {
+      const { state } = await authorize(frontendRedirectUri);
+      const response = await callback(state);
+      expect(response.status).toBe(303);
+      const redirect = new URL(response.headers.get("location") ?? "");
+      expect(`${redirect.origin}${redirect.pathname}`).toBe(frontendRedirectUri);
+      expect(redirect.search).toBe("");
+      expect(new URLSearchParams(redirect.hash.slice(1)).get("code")).not.toBe("");
+    },
+  );
+
   it("不在 allowlist 的前端地址在访问 Provider 前被拒绝", async () => {
     const invalidUris = [
       "https://attacker.test/oauth/callback",
@@ -312,6 +330,8 @@ describe("OIDC 登录闭环", () => {
       `${FRONTEND_REDIRECT_URI}#fragment`,
       "https://user@frontend.test/oauth/callback",
       "https://frontend.test.attacker.test/oauth/callback",
+      "http://frontend.test/oauth/callback",
+      "http://localhost.attacker.test:4174/auth/callback",
     ];
     for (const frontendRedirectUri of invalidUris) {
       const parameters = new URLSearchParams({

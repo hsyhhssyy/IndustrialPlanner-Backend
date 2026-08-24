@@ -145,7 +145,10 @@ jobs:
               and ($oauth.frontendRedirectUris | type == "array" and length > 0 and length <= 32)
               and ($oauth.frontendRedirectUris | all(.[];
                 configured
-                and startswith("https://")
+                and (
+                  startswith("https://")
+                  or ($environment == "beta" and startswith("http://"))
+                )
                 and (contains("?") | not)
                 and (contains("#") | not)
               ))
@@ -164,12 +167,20 @@ jobs:
             const [configFile, environment] = process.argv.slice(2);
             const values = JSON.parse(fs.readFileSync(configFile, "utf8"))[environment]
               .oauth.frontendRedirectUris;
+            const loopbackHostnames = new Set(["localhost", "127.0.0.1", "[::1]"]);
             const normalized = values.map((value) => {
               if (value.length > 2048 || value.includes("?") || value.includes("#")) {
                 throw new Error("unsafe URL");
               }
               const url = new URL(value);
-              if (url.protocol !== "https:" || url.username || url.password) {
+              const isBetaLoopback = environment === "beta"
+                && url.protocol === "http:"
+                && loopbackHostnames.has(url.hostname);
+              if (
+                (url.protocol !== "https:" && !isBetaLoopback)
+                || url.username
+                || url.password
+              ) {
                 throw new Error("unsafe URL");
               }
               return url.href;

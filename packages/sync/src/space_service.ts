@@ -9,6 +9,7 @@ import type {
   PrepareDeletion,
   PrepareObject,
   PrepareResponse,
+  R2Slot,
   SpaceRevision,
   SpaceRow,
   StorageConfig,
@@ -20,6 +21,9 @@ import type {
 import {
   buildSpaceRevision,
   deriveFixedR2Key,
+  deriveR2SlotKey,
+  inactiveR2Slot,
+  isSpaceAvailableAt,
   selectStorageBackend,
 } from "./space_model";
 import type { SpaceRepository } from "./space_repository";
@@ -56,8 +60,18 @@ interface PrepareDeps extends BaseDeps {
   storage: StorageConfig;
 }
 
+const RECOVERABLE_BATCHES_PER_CRON = 1;
+const EXPIRED_SPACE_ROWS_PER_CRON = 8;
+const SPACE_CLEANUP_LEASE_MS = 60_000;
+
 function iso(now: number): string {
   return new Date(now).toISOString();
+}
+
+function assertSpaceAvailable(space: SpaceRow, now: number): void {
+  if (!isSpaceAvailableAt(space, now)) {
+    throw new SpaceProtocolError(410, "space_expired", "临时空间已经过期");
+  }
 }
 
 function itemKey(item: Pick<UploadItemRow, "assetType" | "assetId">): string {
@@ -118,10 +132,65 @@ function reusableCopy(asset: AssetRow | null, target: "d1" | "r2", object: Prepa
       asset.d1ByteSize === object.blobByteSize &&
       asset.d1Encoding === object.encoding;
   }
-  return asset.r2Present &&
-    asset.r2BlobHash === object.blobHash &&
-    asset.r2ByteSize === object.blobByteSize &&
-    asset.r2Encoding === object.encoding;
+  return matchingR2Slot(asset, object) !== null;
+}
+
+function r2SlotState(asset: AssetRow, slot: R2Slot): {
+  key: string;
+  present: boolean;
+  blobHash: string | null;
+  byteSize: number | null;
+  encoding: string | null;
+  version: string | null;
+  etag: string | null;
+} {
+  if (slot === "a") {
+    return {
+      key: asset.r2Key,
+      present: asset.r2Present,
+      blobHash: asset.r2BlobHash,
+      byteSize: asset.r2ByteSize,
+      encoding: asset.r2Encoding,
+      version: asset.r2Version,
+      etag: asset.r2Etag,
+    };
+  }
+  return {
+    key: deriveR2SlotKey(asset.r2Key, "b"),
+    present: asset.r2BPresent,
+    blobHash: asset.r2BBlobHash,
+    byteSize: asset.r2BByteSize,
+    encoding: asset.r2BEncoding,
+    version: asset.r2BVersion,
+    etag: asset.r2BEtag,
+  };
+}
+
+function slotMatchesObject(asset: AssetRow, slot: R2Slot, object: PrepareObject): boolean {
+  const state = r2SlotState(asset, slot);
+  return state.present &&
+    state.blobHash === object.blobHash &&
+    state.byteSize === object.blobByteSize &&
+    state.encoding === object.encoding;
+}
+
+function matchingR2Slot(asset: AssetRow | null, object: PrepareObject): R2Slot | null {
+  if (!asset) return null;
+  if (asset.activeBackend === "r2" && slotMatchesObject(asset, asset.r2ActiveSlot, object)) {
+    return asset.r2ActiveSlot;
+  }
+  if (slotMatchesObject(asset, "a", object)) return "a";
+  if (slotMatchesObject(asset, "b", object)) return "b";
+  return null;
+}
+
+function targetR2Slot(asset: AssetRow | null, object: PrepareObject): R2Slot {
+  const reusable = matchingR2Slot(asset, object);
+  if (reusable) return reusable;
+  if (!asset) return "a";
+  if (!asset.r2Present) return "a";
+  if (!asset.r2BPresent) return "b";
+  return inactiveR2Slot(asset.r2ActiveSlot);
 }
 
 function buildUploadUrl(
@@ -220,8 +289,8 @@ function objectMatchesCompletedR2(object: R2Object | null, item: UploadItemRow):
 async function completeR2Items(
   items: UploadItemRow[],
   r2Bucket: R2Bucket,
-): Promise<Record<string, string>> {
-  const versions: Record<string, string> = {};
+): Promise<Record<string, { version: string; etag: string }>> {
+  const completions: Record<string, { version: string; etag: string }> = {};
   for (const item of items) {
     if (item.targetBackend !== "r2" || !item.r2MultipartUploadId) continue;
     if (!item.partEtag || item.state !== "reserved") {
@@ -244,9 +313,9 @@ async function completeR2Items(
     if (!objectMatchesCompletedR2(object, item)) {
       throw new Error(`R2 对象 ${item.objectKey} 完成后校验失败`);
     }
-    versions[itemKey(item)] = object.version;
+    completions[itemKey(item)] = { version: object.version, etag: object.etag };
   }
-  return versions;
+  return completions;
 }
 
 function resultForBatch(
@@ -280,10 +349,10 @@ async function deleteR2Items(
 ): Promise<void> {
   for (const deletion of deletions) {
     if (deletion.state === "deleted") continue;
-    if (deletion.state !== "reserved") {
-      throw new Error(`删除项 ${deletion.assetType}/${deletion.assetId} 未达到 reserved 状态`);
+    if (deletion.state !== "committed") {
+      throw new Error(`删除项 ${deletion.assetType}/${deletion.assetId} 未达到 committed 状态`);
     }
-    await deps.r2Bucket.delete(deletion.objectKey);
+    await deps.r2Bucket.delete([...new Set([deletion.objectKey, deletion.objectKeyB])]);
     if (!await deps.repo.markDeleteItemDeleted(
       deletion.uploadId,
       deletion.assetType,
@@ -292,6 +361,22 @@ async function deleteR2Items(
     )) {
       throw new Error(`固定 R2 对象 ${deletion.objectKey} 删除后状态未能推进`);
     }
+  }
+}
+
+async function cleanupPublishedDeletions(
+  batch: UploadBatchRow,
+  deletions: DeleteItemRow[],
+  deps: BaseDeps,
+): Promise<void> {
+  try {
+    await deleteR2Items(deletions, deps);
+  } catch (error) {
+    await deps.repo.setBatchError(
+      batch.uploadId,
+      `已发布 revision 的 R2 删除清理待重试: ${error instanceof Error ? error.message : String(error)}`,
+      iso(deps.now),
+    );
   }
 }
 
@@ -315,6 +400,7 @@ async function cancelInternal(batch: UploadBatchRow, deps: BaseDeps): Promise<bo
 
 export async function recoverBatch(batch: UploadBatchRow, deps: BaseDeps): Promise<CommitResult | null> {
   if (batch.state === "committed") {
+    await cleanupPublishedDeletions(batch, await deps.repo.listDeleteItems(batch.uploadId), deps);
     return batch.resultJson ? commitResultFromJson(batch.resultJson) : null;
   }
   if (batch.state === "cancelling") {
@@ -328,7 +414,7 @@ export async function recoverBatch(batch: UploadBatchRow, deps: BaseDeps): Promi
   if (batch.state !== "committing") return null;
 
   // 获取恢复守卫，防止并发 finalizeCommit 竞态
-  const acquired = await deps.repo.acquireRecoverGuard(batch.uploadId);
+  const acquired = await deps.repo.acquireRecoverGuard(batch.uploadId, iso(deps.now));
   if (!acquired) {
     const updated = await deps.repo.getBatch(batch.uploadId);
     if (updated?.state === "committed" && updated.resultJson) {
@@ -340,18 +426,19 @@ export async function recoverBatch(batch: UploadBatchRow, deps: BaseDeps): Promi
   const items = await deps.repo.listItems(batch.uploadId);
   const deletions = await deps.repo.listDeleteItems(batch.uploadId);
   try {
-    const versions = await completeR2Items(items, deps.r2Bucket);
-    await deleteR2Items(deletions, deps);
+    const completions = await completeR2Items(items, deps.r2Bucket);
     const committedAt = iso(deps.now);
     const result = resultForBatch(batch, items, deletions, committedAt);
     await deps.repo.finalizeCommit({
       batch,
       items,
       deletions,
-      r2Versions: versions,
+      r2Completions: completions,
       result,
       committedAt,
     });
+    const committedDeletions = await deps.repo.listDeleteItems(batch.uploadId);
+    await cleanupPublishedDeletions(batch, committedDeletions, deps);
     return result;
   } catch (error) {
     await deps.repo.setBatchError(
@@ -366,6 +453,9 @@ export async function recoverBatch(batch: UploadBatchRow, deps: BaseDeps): Promi
 }
 
 export async function recoverSpace(spaceId: string, deps: BaseDeps): Promise<void> {
+  const space = await deps.repo.getSpace(spaceId);
+  if (!space) throw new SpaceProtocolError(404, "space_not_found", "空间不存在");
+  assertSpaceAvailable(space, deps.now);
   const pending = await deps.repo.getPendingBatch(spaceId);
   if (pending) await recoverBatch(pending, deps);
 }
@@ -382,6 +472,9 @@ export async function prepareSpaceUpload(
   if (!clientBatchId) {
     throw new SpaceProtocolError(400, "bad_request", "clientBatchId 不能为空");
   }
+  const initialSpace = await deps.repo.getSpace(spaceId);
+  if (!initialSpace) throw new SpaceProtocolError(404, "space_not_found", "空间不存在");
+  assertSpaceAvailable(initialSpace, deps.now);
   const digest = await descriptorHash(requestContent);
   const existing = await deps.repo.getBatchByClientId(spaceId, clientBatchId);
   if (existing) {
@@ -413,6 +506,7 @@ export async function prepareSpaceUpload(
   await recoverSpace(spaceId, deps);
   const space = await deps.repo.getSpace(spaceId);
   if (!space) throw new SpaceProtocolError(404, "space_not_found", "空间不存在");
+  assertSpaceAvailable(space, deps.now);
   if (space.pendingUploadId) {
     throw new SpaceProtocolError(409, "space_locked", "空间已有上传事务", {
       uploadId: space.pendingUploadId,
@@ -454,6 +548,8 @@ export async function prepareSpaceUpload(
     const asset = await deps.repo.getAsset(spaceId, object.assetType, object.assetId);
     const sourceBackend = asset?.activeBackend ?? "d1";
     const targetBackend = selectStorageBackend(sourceBackend, object.blobByteSize, deps.storage);
+    const r2PrimaryKey = asset?.r2Key ?? deriveFixedR2Key(spaceId, object.assetType, object.assetId);
+    const selectedR2Slot = targetBackend === "r2" ? targetR2Slot(asset, object) : null;
     const reusable = reusableCopy(asset, targetBackend, object);
     if (targetBackend === "d1" && !reusable) d1Bytes += object.blobByteSize;
     items.push({
@@ -462,7 +558,11 @@ export async function prepareSpaceUpload(
       spaceId,
       sourceBackend,
       targetBackend,
-      objectKey: asset?.r2Key ?? deriveFixedR2Key(spaceId, object.assetType, object.assetId),
+      r2PrimaryKey,
+      targetR2Slot: selectedR2Slot,
+      objectKey: selectedR2Slot === null
+        ? r2PrimaryKey
+        : deriveR2SlotKey(r2PrimaryKey, selectedR2Slot),
       r2MultipartUploadId: null,
       partEtag: null,
       d1Content: null,
@@ -486,6 +586,7 @@ export async function prepareSpaceUpload(
       uploadId,
       spaceId,
       objectKey: asset.r2Key,
+      objectKeyB: deriveR2SlotKey(asset.r2Key, "b"),
       state: "issued",
       createdAt: now,
       updatedAt: now,
@@ -545,6 +646,7 @@ export async function uploadSpaceObject(
     deps.repo.getBatch(path.uploadId),
     deps.repo.getItem(path.uploadId, path.assetType, path.assetId),
   ]);
+  if (space) assertSpaceAvailable(space, deps.now);
   if (
     !space || !batch || !item ||
     space.pendingUploadId !== batch.uploadId ||
@@ -587,6 +689,7 @@ export async function uploadSpaceObject(
             assetType: item.assetType,
             assetId: item.assetId,
             sha256: item.blobHash,
+            slot: item.targetR2Slot ?? "a",
           },
         });
         await deps.repo.setMultipartId(item.uploadId, item.assetType, item.assetId, multipart.uploadId, now);
@@ -617,9 +720,13 @@ export async function commitSpaceUpload(
   if (!batch || batch.spaceId !== spaceId) {
     throw new SpaceProtocolError(404, "upload_not_found", "上传批次不存在");
   }
+  const space = await deps.repo.getSpace(spaceId);
+  if (!space) throw new SpaceProtocolError(404, "space_not_found", "空间不存在");
+  assertSpaceAvailable(space, deps.now);
   assertBatchToken(verified.payload as BatchTokenPayload, batch, spaceId);
   if (batch.state === "committed") {
     if (!batch.resultJson) throw new Error("已提交批次缺少幂等结果");
+    await cleanupPublishedDeletions(batch, await deps.repo.listDeleteItems(uploadId), deps);
     return { ...commitResultFromJson(batch.resultJson), status: "already-committed" };
   }
   if (batch.state === "cancelled" || batch.state === "cancelling") {
@@ -661,6 +768,9 @@ export async function cancelSpaceUpload(
   if (!batch || batch.spaceId !== spaceId) {
     throw new SpaceProtocolError(404, "upload_not_found", "上传批次不存在");
   }
+  const space = await deps.repo.getSpace(spaceId);
+  if (!space) throw new SpaceProtocolError(404, "space_not_found", "空间不存在");
+  assertSpaceAvailable(space, deps.now);
   assertBatchToken(verified.payload as BatchTokenPayload, batch, spaceId);
   if (batch.state === "cancelled") return { status: "already-cancelled", uploadId };
   if (batch.state === "committed" || batch.state === "committing") {
@@ -673,15 +783,9 @@ export async function cancelSpaceUpload(
 }
 
 async function assertReadableSpace(spaceId: string, deps: BaseDeps): Promise<SpaceRow> {
-  await recoverSpace(spaceId, deps);
   const space = await deps.repo.getSpace(spaceId);
   if (!space) throw new SpaceProtocolError(404, "space_not_found", "空间不存在");
-  if (space.pendingUploadId) {
-    throw new SpaceProtocolError(423, "space_locked", "空间存在未完成上传事务", {
-      uploadId: space.pendingUploadId,
-      expiresAt: space.lockExpiresAt,
-    });
-  }
+  assertSpaceAvailable(space, deps.now);
   return space;
 }
 
@@ -689,8 +793,10 @@ export async function planSpace(
   spaceId: string,
   deps: BaseDeps & { publicBaseUrl: string },
 ): Promise<PlanResponse> {
-  const space = await assertReadableSpace(spaceId, deps);
-  const assets = await deps.repo.listAssets(spaceId);
+  const snapshot = await deps.repo.getPlanSnapshot(spaceId);
+  if (!snapshot) throw new SpaceProtocolError(404, "space_not_found", "空间不存在");
+  const { space, assets } = snapshot;
+  assertSpaceAvailable(space, deps.now);
   return {
     spaceId,
     revision: space.revision,
@@ -757,8 +863,10 @@ export async function downloadSpaceObject(
   ) {
     throw new SpaceProtocolError(403, "token_scope_mismatch", "下载票据与路径不匹配");
   }
-  const space = await assertReadableSpace(path.spaceId, deps);
-  const asset = await deps.repo.getAsset(path.spaceId, path.assetType, path.assetId);
+  const snapshot = await deps.repo.getAssetSnapshot(path.spaceId, path.assetType, path.assetId);
+  if (!snapshot) throw new SpaceProtocolError(404, "space_not_found", "空间不存在");
+  const { space, asset } = snapshot;
+  assertSpaceAvailable(space, deps.now);
   if (!asset || String(payload.revision) !== space.revision || payload.blobHash !== asset.contentHash) {
     throw new SpaceProtocolError(409, "download_stale", "下载票据对应的 space revision 已经过期");
   }
@@ -772,15 +880,97 @@ export async function downloadSpaceObject(
     if (!asset.d1Content) throw new Error("当前 D1 payload 缺失");
     return { body: asset.d1Content, headers };
   }
-  const object = await deps.r2Bucket.get(asset.r2Key);
-  if (!object) throw new Error("当前 R2 payload 缺失");
+  const activeR2 = r2SlotState(asset, asset.r2ActiveSlot);
+  if (
+    !activeR2.present ||
+    activeR2.blobHash !== asset.contentHash ||
+    activeR2.byteSize !== asset.byteSize ||
+    activeR2.encoding !== asset.encoding
+  ) {
+    throw new Error("当前 R2 active slot metadata 不一致");
+  }
+  const object = await deps.r2Bucket.get(
+    activeR2.key,
+    activeR2.etag ? { onlyIf: { etagMatches: activeR2.etag } } : undefined,
+  );
+  if (!object || !("body" in object)) {
+    throw new SpaceProtocolError(409, "download_stale", "下载对象槽已经变化，请重新获取 plan");
+  }
+  if (
+    object.size !== asset.byteSize ||
+    (object.customMetadata?.sha256 !== undefined && object.customMetadata.sha256 !== asset.contentHash)
+  ) {
+    throw new SpaceProtocolError(409, "download_stale", "下载对象内容与已发布 revision 不匹配");
+  }
   return { body: object.body, headers };
 }
 
-export async function cleanupRecoverableBatches(deps: BaseDeps, limit = 50): Promise<number> {
-  const batches = await deps.repo.listRecoverableBatches(iso(deps.now), limit);
+export async function cleanupRecoverableBatches(deps: BaseDeps): Promise<number> {
+  const batches = await deps.repo.listRecoverableBatches(iso(deps.now), RECOVERABLE_BATCHES_PER_CRON);
   for (const batch of batches) await recoverBatch(batch, deps);
-  return batches.length;
+  if (batches.length > 0) return batches.length;
+  const cleanupBatches = await deps.repo.listPendingDeleteCleanupBatches(RECOVERABLE_BATCHES_PER_CRON);
+  for (const batch of cleanupBatches) await recoverBatch(batch, deps);
+  return cleanupBatches.length;
+}
+
+export async function cleanupExpiredSpaces(deps: BaseDeps): Promise<number> {
+  const now = iso(deps.now);
+  const leaseExpiresAt = iso(deps.now + SPACE_CLEANUP_LEASE_MS);
+  const space = await deps.repo.claimExpiredSpace(now, leaseExpiresAt);
+  if (!space) return 0;
+
+  let deletedSpace = false;
+  try {
+    const uploadItems = await deps.repo.listSpaceCleanupUploadItems(space.spaceId, EXPIRED_SPACE_ROWS_PER_CRON);
+    if (uploadItems.length > 0) {
+      const liveUpload = uploadItems.some((item) =>
+        item.state === "uploading" &&
+        item.leaseExpiresAt !== null &&
+        Date.parse(item.leaseExpiresAt) > deps.now
+      );
+      if (liveUpload) return 1;
+
+      for (const item of uploadItems) {
+        if (!item.r2MultipartUploadId) continue;
+        try {
+          await deps.r2Bucket.resumeMultipartUpload(item.objectKey, item.r2MultipartUploadId).abort();
+        } catch {
+          // multipart 可能已完成或被 R2 回收；固定对象删除仍可幂等继续。
+        }
+      }
+      await deps.r2Bucket.delete([...new Set(uploadItems.map((item) => item.objectKey))]);
+      await deps.repo.deleteSpaceCleanupUploadItems(space.spaceId, uploadItems);
+      return 1;
+    }
+
+    const deleteItems = await deps.repo.listSpaceCleanupDeleteItems(space.spaceId, EXPIRED_SPACE_ROWS_PER_CRON);
+    if (deleteItems.length > 0) {
+      await deps.r2Bucket.delete([...new Set(deleteItems.flatMap((item) => [item.objectKey, item.objectKeyB]))]);
+      await deps.repo.deleteSpaceCleanupDeleteItems(space.spaceId, deleteItems);
+      return 1;
+    }
+
+    const assets = await deps.repo.listSpaceCleanupAssets(space.spaceId, EXPIRED_SPACE_ROWS_PER_CRON);
+    if (assets.length > 0) {
+      await deps.r2Bucket.delete([...new Set(assets.flatMap((asset) => [asset.r2Key, asset.r2KeyB]))]);
+      await deps.repo.deleteSpaceCleanupAssets(space.spaceId, assets);
+      return 1;
+    }
+
+    const batches = await deps.repo.listSpaceCleanupBatches(space.spaceId, EXPIRED_SPACE_ROWS_PER_CRON);
+    if (batches.length > 0) {
+      await deps.repo.deleteSpaceCleanupBatches(space.spaceId, batches);
+      return 1;
+    }
+
+    deletedSpace = await deps.repo.finishSpaceCleanup(space.spaceId, leaseExpiresAt);
+    return deletedSpace ? 1 : 0;
+  } finally {
+    if (!deletedSpace) {
+      await deps.repo.releaseSpaceCleanupLease(space.spaceId, leaseExpiresAt);
+    }
+  }
 }
 
 // ============================================================================
@@ -789,7 +979,7 @@ export async function cleanupRecoverableBatches(deps: BaseDeps, limit = 50): Pro
 
 async function forceCancelInternal(batch: UploadBatchRow, deps: BaseDeps): Promise<boolean> {
   if (batch.state === "cancelled") return true;
-  if (batch.state === "committed") return false;
+  if (batch.state === "committed" || batch.state === "committing") return false;
   const now = iso(deps.now);
   if (!await deps.repo.beginForceAbort(batch.uploadId, now)) return false;
   const items = await deps.repo.listItems(batch.uploadId);
@@ -811,6 +1001,7 @@ export async function getSpaceTransaction(
 ): Promise<TransactionStatusResponse> {
   const space = await deps.repo.getSpace(spaceId);
   if (!space) throw new SpaceProtocolError(404, "space_not_found", "空间不存在");
+  assertSpaceAvailable(space, deps.now);
 
   const detail = await deps.repo.getTransactionDetail(spaceId);
   if (!detail) return { hasActiveTransaction: false };
@@ -824,6 +1015,7 @@ export async function abortSpaceTransaction(
 ): Promise<AbortResponse> {
   const space = await deps.repo.getSpace(spaceId);
   if (!space) throw new SpaceProtocolError(404, "space_not_found", "空间不存在");
+  assertSpaceAvailable(space, deps.now);
 
   if (!space.pendingUploadId) return { status: "no-transaction" };
 
@@ -849,6 +1041,10 @@ export async function abortSpaceTransaction(
   }
 
   // prepared 或 committing → 强制丢弃
+  // AI-CORRECTION 2026-08-24: committing 已进入外部写入阶段，只能 roll-forward；强制丢弃仅允许 prepared。
+  if (batch.state === "committing") {
+    throw new SpaceProtocolError(409, "commit_in_progress", "commit 开始后只能向前恢复，不能强制丢弃");
+  }
   if (!await forceCancelInternal(batch, deps)) {
     throw new SpaceProtocolError(409, "abort_failed", "事务丢弃失败，可能已经提交");
   }

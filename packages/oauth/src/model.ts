@@ -20,8 +20,14 @@ export function normalizeFrontendRedirectUri(value: string): string | null {
   } catch {
     return null;
   }
+  const usesSecureTransport = url.protocol === "https:";
+  const usesLoopbackHttp = url.protocol === "http:" && (
+    url.hostname === "localhost"
+    || url.hostname === "127.0.0.1"
+    || url.hostname === "[::1]"
+  );
   if (
-    url.protocol !== "https:"
+    (!usesSecureTransport && !usesLoopbackHttp)
     || url.username
     || url.password
     || url.search

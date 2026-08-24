@@ -23,7 +23,7 @@ export default {
       return withCors(errorResponse, ANONYMOUS_CORS_HEADERS);
     }
   },
-  scheduled: async (_controller: ScheduledController, env: SpaceSyncEnv, ctx: ExecutionContext) => {
-    ctx.waitUntil(runScheduledCleanup(env));
+  scheduled: async (controller: ScheduledController, env: SpaceSyncEnv, ctx: ExecutionContext) => {
+    ctx.waitUntil(runScheduledCleanup(env, controller.scheduledTime));
   },
 };

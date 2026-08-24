@@ -50,7 +50,7 @@
     "_jwt_note": "同一环境内 sync/gateway/identity 的 JWT_SECRET 必须是同一个值"
   },
   "beta": {
-    "_comment": "测试环境：允许匿名空间，OAuth 登录也可用",
+    "_comment": "测试环境：只允许 e2e-cf-* 前端 E2E 空间匿名创建和访问；临时空间固定一小时后失效并由 Cron 清理，OAuth 登录也可用",
     "namespace": "your-namespace",
     "domain": "your-domain.example.com",
     "cloudflare_api_token": "your-beta-cloudflare-api-token",
@@ -66,7 +66,9 @@
       "frontendRedirectUris": [
         "<beta-dev-frontend-oauth-landing-uri>",
         "<beta-pre-frontend-oauth-landing-uri>",
-        "<beta-frontend-oauth-landing-uri>"
+        "<beta-frontend-oauth-landing-uri>",
+        "http://localhost:4174/auth/callback",
+        "http://127.0.0.1:4174/auth/callback"
       ]
     },
     "d1": {
