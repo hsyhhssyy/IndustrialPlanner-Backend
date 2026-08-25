@@ -221,6 +221,7 @@ beforeAll(async () => {
   env = {
     DB: db,
     IDENTITY: identityBinding,
+    OAUTH_ENABLED: "true",
     OIDC_DISCOVERY_URL: DISCOVERY_URL,
     OIDC_CLIENT_ID: CLIENT_ID,
     OIDC_CLIENT_SECRET: CLIENT_SECRET,
@@ -251,6 +252,59 @@ afterAll(async () => {
 });
 
 describe("OIDC 登录闭环", () => {
+  it("显式禁用时所有 OAuth 动态端点 fail-closed 且不访问 Provider", async () => {
+    const app = createOAuthApp({ oidcFetch: providerFetch });
+    const disabledEnv: OAuthEnv = {
+      DB: env.DB,
+      IDENTITY: identityBinding,
+      OAUTH_ENABLED: "false",
+    };
+    const transactionsBefore = await env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM oauth_login_transactions",
+    ).first<{ count: number }>();
+    const health = await app.fetch(new Request("https://backend.test/health"), disabledEnv);
+    expect(health.status).toBe(200);
+    const requests = [
+      new Request("https://backend.test/v1/oauth/authorize"),
+      new Request("https://backend.test/v1/oauth/callback"),
+      new Request("https://backend.test/v1/oauth/session", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "not-json",
+      }),
+    ];
+    for (const incoming of requests) {
+      const response = await app.fetch(incoming, disabledEnv);
+      expect(response.status).toBe(503);
+      expect(response.headers.get("cache-control")).toBe("no-store");
+      expect(await response.json()).toEqual({
+        error: "service_unavailable",
+        message: "OAuth 登录未启用",
+      });
+    }
+    expect(provider.requests).toEqual([]);
+    const transactionsAfter = await env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM oauth_login_transactions",
+    ).first<{ count: number }>();
+    expect(transactionsAfter?.count).toBe(transactionsBefore?.count);
+  });
+
+  it("OAuth 开关缺失或非法时返回配置错误", async () => {
+    const app = createOAuthApp({ oidcFetch: providerFetch });
+    for (const value of [undefined, "TRUE", "1"]) {
+      const response = await app.fetch(
+        new Request("https://backend.test/v1/oauth/authorize"),
+        { ...env, OAUTH_ENABLED: value },
+      );
+      expect(response.status).toBe(500);
+      expect(await response.json()).toEqual({
+        error: "configuration_error",
+        message: "OAuth 服务配置无效",
+      });
+    }
+    expect(provider.requests).toEqual([]);
+  });
+
   it("首次登录创建映射并只允许兑换一次后端会话", async () => {
     const { state } = await authorize();
     const callbackResponse = await callback(state);

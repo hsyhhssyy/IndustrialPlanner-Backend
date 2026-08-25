@@ -158,7 +158,10 @@ function providerHandler(provider: ProviderState) {
   };
 }
 
-async function createHarness(allowAnonymousSpaces: boolean): Promise<Harness> {
+async function createHarness(
+  allowAnonymousSpaces: boolean,
+  oauthEnabled = true,
+): Promise<Harness> {
   const provider: ProviderState = { nonce: "", codeChallenge: "", requests: [], tokenForm: {} };
   const allow = String(allowAnonymousSpaces);
   const workers: NonNullable<Extract<MiniflareOptions, { workers: unknown }> ["workers"]> = [
@@ -185,11 +188,14 @@ async function createHarness(allowAnonymousSpaces: boolean): Promise<Harness> {
       serviceBindings: { IDENTITY: "identity" },
       outboundService: providerHandler(provider),
       bindings: {
-        OIDC_DISCOVERY_URL: DISCOVERY_URL,
-        OIDC_CLIENT_ID: CLIENT_ID,
-        OIDC_CLIENT_SECRET: CLIENT_SECRET,
-        OIDC_REDIRECT_URI: REDIRECT_URI,
-        OAUTH_FRONTEND_REDIRECT_URIS: JSON.stringify([FRONTEND_REDIRECT_URI]),
+        OAUTH_ENABLED: String(oauthEnabled),
+        ...(oauthEnabled ? {
+          OIDC_DISCOVERY_URL: DISCOVERY_URL,
+          OIDC_CLIENT_ID: CLIENT_ID,
+          OIDC_CLIENT_SECRET: CLIENT_SECRET,
+          OIDC_REDIRECT_URI: REDIRECT_URI,
+          OAUTH_FRONTEND_REDIRECT_URIS: JSON.stringify([FRONTEND_REDIRECT_URI]),
+        } : {}),
         INTERNAL_SERVICE_SECRET: INTERNAL_SECRET,
       },
     },
@@ -321,12 +327,13 @@ describe("Miniflare 多 Worker OIDC 与同步端到端", () => {
     const secondToken = await login(harness);
     const secondSpace = await mine(harness, secondToken);
     expect(secondSpace.spaceId).toBe(firstSpace.spaceId);
-  });
+  }, 15_000);
 
-  it("stable 保持 telemetry/capabilities 匿名但拒绝匿名数据路径", async () => {
-    const harness = await createHarness(false);
+  it("stable 可禁用 OAuth，保持 telemetry/capabilities 匿名但拒绝匿名数据路径", async () => {
+    const harness = await createHarness(false, false);
     const telemetry = await harness.miniflare.dispatchFetch("https://gateway.test/v1/telemetry/events");
     const capabilities = await harness.miniflare.dispatchFetch("https://gateway.test/v1/sync/capabilities");
+    const oauth = await harness.miniflare.dispatchFetch("https://gateway.test/v1/oauth/authorize");
     const anonymousData = await harness.miniflare.dispatchFetch("https://gateway.test/v1/sync/spaces", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -334,6 +341,9 @@ describe("Miniflare 多 Worker OIDC 与同步端到端", () => {
     });
     expect(telemetry.status).toBe(204);
     expect(capabilities.status).toBe(200);
+    expect(oauth.status).toBe(503);
+    expect(await oauth.json()).toMatchObject({ error: "service_unavailable" });
+    expect(harness.provider.requests).toEqual([]);
     expect(anonymousData.status).toBe(401);
   });
 });

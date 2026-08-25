@@ -16,6 +16,7 @@ binding = "IDENTITY"
 service = "industrial-identity"
 
 [vars]
+OAUTH_ENABLED = "false"
 OAUTH_LOGIN_TTL_SECONDS = "600"
 OAUTH_CALLBACK_CODE_TTL_SECONDS = "60"
 
@@ -34,6 +35,7 @@ binding = "IDENTITY"
 service = "industrial-identity-beta"
 
 [env.beta.vars]
+OAUTH_ENABLED = "true"
 OAUTH_LOGIN_TTL_SECONDS = "600"
 OAUTH_CALLBACK_CODE_TTL_SECONDS = "60"
 

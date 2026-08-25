@@ -124,6 +124,7 @@ jobs:
                 then $target.flags.allowAnonymousSpaces == false
                 else $target.flags.allowAnonymousSpaces == true
               end)
+              and ($target.flags.enableOAuth | type == "boolean")
               and ($sync | type == "object")
               and ($sync.COMMIT_TOKEN_SECRET | type == "string" and length >= 32)
               and ($sync.R2_ACCESS_KEY_ID | configured)
@@ -138,23 +139,25 @@ jobs:
               and ($identity.INTERNAL_SERVICE_SECRET | secret32)
               and ($oauth_secret.INTERNAL_SERVICE_SECRET | secret32)
               and ($identity.INTERNAL_SERVICE_SECRET == $oauth_secret.INTERNAL_SERVICE_SECRET)
-              and ($oauth_secret.OIDC_CLIENT_SECRET | configured)
-              and ($oauth.discoveryUrl | configured and startswith("https://") and endswith("/.well-known/openid-configuration"))
-              and ($oauth.clientId | configured)
-              and ($oauth.redirectUri | configured and startswith("https://"))
-              and ($oauth.frontendRedirectUris | type == "array" and length > 0 and length <= 32)
-              and ($oauth.frontendRedirectUris | all(.[];
-                configured
-                and (
-                  startswith("https://")
-                  or ($environment == "beta" and startswith("http://"))
-                )
-                and (contains("?") | not)
-                and (contains("#") | not)
-              ))
-              and (($oauth.frontendRedirectUris | unique | length) == ($oauth.frontendRedirectUris | length))
               and ($target.d1.identityDatabaseId | uuid)
               and ($target.d1.oauthDatabaseId | uuid)
+              and (if $target.flags.enableOAuth then
+                ($oauth_secret.OIDC_CLIENT_SECRET | configured)
+                and ($oauth.discoveryUrl | configured and startswith("https://") and endswith("/.well-known/openid-configuration"))
+                and ($oauth.clientId | configured)
+                and ($oauth.redirectUri | configured and startswith("https://"))
+                and ($oauth.frontendRedirectUris | type == "array" and length > 0 and length <= 32)
+                and ($oauth.frontendRedirectUris | all(.[];
+                  configured
+                  and (
+                    startswith("https://")
+                    or ($environment == "beta" and startswith("http://"))
+                  )
+                  and (contains("?") | not)
+                  and (contains("#") | not)
+                ))
+                and (($oauth.frontendRedirectUris | unique | length) == ($oauth.frontendRedirectUris | length))
+              else true end)
           ' "$config_file" >/dev/null; then
             echo "Missing, placeholder, inconsistent, or invalid deploy config for $CF_ENVIRONMENT" >&2
             exit 1
@@ -165,8 +168,10 @@ jobs:
           let valid = false;
           try {
             const [configFile, environment] = process.argv.slice(2);
-            const values = JSON.parse(fs.readFileSync(configFile, "utf8"))[environment]
-              .oauth.frontendRedirectUris;
+            const target = JSON.parse(fs.readFileSync(configFile, "utf8"))[environment];
+            if (target.flags.enableOAuth === false) process.exit(0);
+            if (target.flags.enableOAuth !== true) throw new Error("invalid OAuth flag");
+            const values = target.oauth.frontendRedirectUris;
             const loopbackHostnames = new Set(["localhost", "127.0.0.1", "[::1]"]);
             const normalized = values.map((value) => {
               if (value.length > 2048 || value.includes("?") || value.includes("#")) {
@@ -204,6 +209,7 @@ jobs:
           echo "CLOUDFLARE_API_TOKEN=$cf_token" >> "$GITHUB_ENV"
           echo "DEPLOY_CONFIG_FILE=$config_file" >> "$GITHUB_ENV"
           echo "ALLOW_ANONYMOUS_SPACES=$(jq -r --arg environment "$CF_ENVIRONMENT" '.[$environment].flags.allowAnonymousSpaces' "$config_file")" >> "$GITHUB_ENV"
+          echo "OAUTH_ENABLED=$(jq -r --arg environment "$CF_ENVIRONMENT" '.[$environment].flags.enableOAuth' "$config_file")" >> "$GITHUB_ENV"
           echo "OIDC_DISCOVERY_URL=$(jq -r --arg environment "$CF_ENVIRONMENT" '.[$environment].oauth.discoveryUrl' "$config_file")" >> "$GITHUB_ENV"
           echo "OIDC_CLIENT_ID=$(jq -r --arg environment "$CF_ENVIRONMENT" '.[$environment].oauth.clientId' "$config_file")" >> "$GITHUB_ENV"
           echo "OIDC_REDIRECT_URI=$(jq -r --arg environment "$CF_ENVIRONMENT" '.[$environment].oauth.redirectUri' "$config_file")" >> "$GITHUB_ENV"
@@ -233,7 +239,13 @@ jobs:
             sed -i "s/00000000-0000-0000-0000-000000000003/$OAUTH_D1_ID/" packages/oauth/wrangler.toml
           fi
           jq -c --arg environment "$CF_ENVIRONMENT" '.[$environment].secrets.identity' "$DEPLOY_CONFIG_FILE" > "$RUNNER_TEMP/identity-secrets.json"
-          jq -c --arg environment "$CF_ENVIRONMENT" '.[$environment].secrets.oauth' "$DEPLOY_CONFIG_FILE" > "$RUNNER_TEMP/oauth-secrets.json"
+          if [ "$OAUTH_ENABLED" = 'true' ]; then
+            jq -c --arg environment "$CF_ENVIRONMENT" '.[$environment].secrets.oauth' "$DEPLOY_CONFIG_FILE" > "$RUNNER_TEMP/oauth-secrets.json"
+          else
+            jq -c --arg environment "$CF_ENVIRONMENT" '{
+              INTERNAL_SERVICE_SECRET: .[$environment].secrets.oauth.INTERNAL_SERVICE_SECRET
+            }' "$DEPLOY_CONFIG_FILE" > "$RUNNER_TEMP/oauth-secrets.json"
+          fi
           jq -c --arg environment "$CF_ENVIRONMENT" '.[$environment].secrets.sync' "$DEPLOY_CONFIG_FILE" > "$RUNNER_TEMP/sync-secrets.json"
           jq -c --arg environment "$CF_ENVIRONMENT" '.[$environment].secrets.gateway' "$DEPLOY_CONFIG_FILE" > "$RUNNER_TEMP/gateway-secrets.json"
 
@@ -270,12 +282,19 @@ jobs:
             # Risk: Low
             # Human Review: Required
             # Original code: --var "OAUTH_FRONTEND_REDIRECT_URI:$OAUTH_FRONTEND_REDIRECT_URI"
-            pnpm --filter @industrial/oauth exec -- npx wrangler deploy --env beta \
-              --secrets-file "$RUNNER_TEMP/oauth-secrets.json" \
-              --var "OIDC_DISCOVERY_URL:$OIDC_DISCOVERY_URL" \
-              --var "OIDC_CLIENT_ID:$OIDC_CLIENT_ID" \
-              --var "OIDC_REDIRECT_URI:$OIDC_REDIRECT_URI" \
-              --var "OAUTH_FRONTEND_REDIRECT_URIS:$OAUTH_FRONTEND_REDIRECT_URIS"
+            if [ "$OAUTH_ENABLED" = 'true' ]; then
+              pnpm --filter @industrial/oauth exec -- npx wrangler deploy --env beta \
+                --secrets-file "$RUNNER_TEMP/oauth-secrets.json" \
+                --var "OAUTH_ENABLED:true" \
+                --var "OIDC_DISCOVERY_URL:$OIDC_DISCOVERY_URL" \
+                --var "OIDC_CLIENT_ID:$OIDC_CLIENT_ID" \
+                --var "OIDC_REDIRECT_URI:$OIDC_REDIRECT_URI" \
+                --var "OAUTH_FRONTEND_REDIRECT_URIS:$OAUTH_FRONTEND_REDIRECT_URIS"
+            else
+              pnpm --filter @industrial/oauth exec -- npx wrangler deploy --env beta \
+                --secrets-file "$RUNNER_TEMP/oauth-secrets.json" \
+                --var "OAUTH_ENABLED:false"
+            fi
             pnpm --filter @industrial/sync exec -- npx wrangler deploy --env beta \
               --secrets-file "$RUNNER_TEMP/sync-secrets.json" \
               --var "ALLOW_ANONYMOUS_SPACES:$ALLOW_ANONYMOUS_SPACES"
@@ -307,12 +326,19 @@ jobs:
             # Risk: Low
             # Human Review: Required
             # Original code: --var "OAUTH_FRONTEND_REDIRECT_URI:$OAUTH_FRONTEND_REDIRECT_URI"
-            pnpm --filter @industrial/oauth exec -- npx wrangler deploy \
-              --secrets-file "$RUNNER_TEMP/oauth-secrets.json" \
-              --var "OIDC_DISCOVERY_URL:$OIDC_DISCOVERY_URL" \
-              --var "OIDC_CLIENT_ID:$OIDC_CLIENT_ID" \
-              --var "OIDC_REDIRECT_URI:$OIDC_REDIRECT_URI" \
-              --var "OAUTH_FRONTEND_REDIRECT_URIS:$OAUTH_FRONTEND_REDIRECT_URIS"
+            if [ "$OAUTH_ENABLED" = 'true' ]; then
+              pnpm --filter @industrial/oauth exec -- npx wrangler deploy \
+                --secrets-file "$RUNNER_TEMP/oauth-secrets.json" \
+                --var "OAUTH_ENABLED:true" \
+                --var "OIDC_DISCOVERY_URL:$OIDC_DISCOVERY_URL" \
+                --var "OIDC_CLIENT_ID:$OIDC_CLIENT_ID" \
+                --var "OIDC_REDIRECT_URI:$OIDC_REDIRECT_URI" \
+                --var "OAUTH_FRONTEND_REDIRECT_URIS:$OAUTH_FRONTEND_REDIRECT_URIS"
+            else
+              pnpm --filter @industrial/oauth exec -- npx wrangler deploy \
+                --secrets-file "$RUNNER_TEMP/oauth-secrets.json" \
+                --var "OAUTH_ENABLED:false"
+            fi
             pnpm --filter @industrial/sync exec -- npx wrangler deploy \
               --secrets-file "$RUNNER_TEMP/sync-secrets.json" \
               --var "ALLOW_ANONYMOUS_SPACES:$ALLOW_ANONYMOUS_SPACES"

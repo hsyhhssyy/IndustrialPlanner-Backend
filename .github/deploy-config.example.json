@@ -10,8 +10,9 @@
     "domain": "your-stable-domain.example.com",
     "cloudflare_api_token": "your-stable-cloudflare-api-token",
     "flags": {
-      "_comment": "部署时注入 gateway/sync 的 ALLOW_ANONYMOUS_SPACES 变量",
-      "allowAnonymousSpaces": false
+      "_comment": "部署时分别注入匿名 Space 与 OAuth 登录能力开关；OAuth 关闭时 Provider 配置可暂留占位符",
+      "allowAnonymousSpaces": false,
+      "enableOAuth": false
     },
     "oauth": {
       "_comment": "OIDC Provider callback 与允许的前端完成页，均作为 vars 注入 oauth-worker",
@@ -55,8 +56,9 @@
     "domain": "your-domain.example.com",
     "cloudflare_api_token": "your-beta-cloudflare-api-token",
     "flags": {
-      "_comment": "部署时注入 gateway/sync 的 ALLOW_ANONYMOUS_SPACES 变量",
-      "allowAnonymousSpaces": true
+      "_comment": "部署时分别注入匿名 Space 与 OAuth 登录能力开关",
+      "allowAnonymousSpaces": true,
+      "enableOAuth": true
     },
     "oauth": {
       "_comment": "OIDC Provider callback 与允许的前端完成页，均作为 vars 注入 oauth-worker",

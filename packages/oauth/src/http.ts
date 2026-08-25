@@ -22,6 +22,7 @@ export interface OAuthEnv {
   DB: D1Database;
   IDENTITY: IdentityBinding;
   ENVIRONMENT?: string;
+  OAUTH_ENABLED?: string;
   OIDC_DISCOVERY_URL?: string;
   OIDC_CLIENT_ID?: string;
   OIDC_CLIENT_SECRET?: string;
@@ -53,6 +54,12 @@ function optionalPositiveInteger(value: string | undefined): number | undefined 
   if (value === undefined) return undefined;
   const parsed = Number.parseInt(value, 10);
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : Number.NaN;
+}
+
+function oauthEnabled(value: string | undefined): boolean | null {
+  if (value === "true") return true;
+  if (value === "false") return false;
+  return null;
 }
 
 function required(value: string | undefined, name: string): string {
@@ -163,6 +170,16 @@ export function createOAuthApp(options: OAuthAppOptions = {}): Hono<{ Bindings: 
       return configurationResponse(c);
     }
     return c.json({ error: "internal_error", message: "OAuth 服务内部错误" }, 500);
+  });
+
+  app.use("/v1/oauth/*", async (c, next) => {
+    const enabled = oauthEnabled(c.env.OAUTH_ENABLED);
+    if (enabled === null) return configurationResponse(c);
+    if (!enabled) {
+      c.header("cache-control", "no-store");
+      return c.json({ error: "service_unavailable", message: "OAuth 登录未启用" }, 503);
+    }
+    return next();
   });
 
   app.get("/health", async (c) => {
