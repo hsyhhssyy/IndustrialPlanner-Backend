@@ -2,6 +2,7 @@ import type { OAuthSessionResponse } from "@industrial/shared";
 import type { IdentityClient } from "./identity-client";
 import {
   isValidOAuthChannel,
+  matchesFrontendRedirectUriTemplate,
   normalizeFrontendRedirectUri,
   type OAuthLoginTransaction,
 } from "./model";
@@ -17,6 +18,7 @@ export interface OAuthServiceDependencies {
   provider: LoginIdentityProvider;
   identity: IdentityClient;
   frontendRedirectUris: readonly string[];
+  frontendRedirectUriTemplates: readonly string[];
   loginTtlSeconds?: number;
   callbackCodeTtlSeconds?: number;
   now?: () => number;
@@ -90,7 +92,11 @@ export async function beginAuthorization(
   input: OAuthAuthorizationInput,
   dependencies: OAuthServiceDependencies,
 ): Promise<URL> {
-  const frontendTarget = resolveFrontendTarget(input, dependencies.frontendRedirectUris);
+  const frontendTarget = resolveFrontendTarget(
+    input,
+    dependencies.frontendRedirectUris,
+    dependencies.frontendRedirectUriTemplates,
+  );
   const loginTtl = assertTtl(
     dependencies.loginTtlSeconds ?? DEFAULT_LOGIN_TTL_SECONDS,
     "OAUTH_LOGIN_TTL_SECONDS",
@@ -141,11 +147,12 @@ export async function beginAuthorization(
 function resolveFrontendTarget(
   input: OAuthAuthorizationInput,
   allowedUris: readonly string[],
+  allowedTemplates: readonly string[],
 ): OAuthFrontendTarget {
   const normalized = input.frontendRedirectUri === null
     ? null
     : normalizeFrontendRedirectUri(input.frontendRedirectUri);
-  if (!normalized || !allowedUris.includes(normalized)) {
+  if (!normalized || !isFrontendRedirectUriAllowed(normalized, allowedUris, allowedTemplates)) {
     throw new OAuthServiceError(
       400,
       "oauth_frontend_invalid",
@@ -165,17 +172,29 @@ function resolveFrontendTarget(
 function targetFromTransaction(
   transaction: OAuthLoginTransaction,
   allowedUris: readonly string[],
+  allowedTemplates: readonly string[],
 ): OAuthFrontendTarget | null {
   const normalized = normalizeFrontendRedirectUri(transaction.frontendRedirectUri);
   if (
     !normalized
     || normalized !== transaction.frontendRedirectUri
-    || !allowedUris.includes(normalized)
+    || !isFrontendRedirectUriAllowed(normalized, allowedUris, allowedTemplates)
     || !isValidOAuthChannel(transaction.oauthChannel)
   ) {
     return null;
   }
   return { frontendRedirectUri: normalized, oauthChannel: transaction.oauthChannel };
+}
+
+function isFrontendRedirectUriAllowed(
+  frontendRedirectUri: string,
+  allowedUris: readonly string[],
+  allowedTemplates: readonly string[],
+): boolean {
+  return allowedUris.includes(frontendRedirectUri)
+    || allowedTemplates.some((template) => (
+      matchesFrontendRedirectUriTemplate(frontendRedirectUri, template)
+    ));
 }
 
 export async function completeCallback(
@@ -198,6 +217,7 @@ export async function completeCallback(
   const frontendTarget = targetFromTransaction(
     transaction,
     dependencies.frontendRedirectUris,
+    dependencies.frontendRedirectUriTemplates,
   );
   if (!frontendTarget) {
     throw new OAuthServiceError(400, "oauth_state_invalid", "OAuth state 无效或已过期");

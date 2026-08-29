@@ -157,21 +157,67 @@ jobs:
                   and (contains("#") | not)
                 ))
                 and (($oauth.frontendRedirectUris | unique | length) == ($oauth.frontendRedirectUris | length))
+                and (($oauth.frontendRedirectUriTemplates // []) | type == "array" and length <= 32)
+                and (($oauth.frontendRedirectUriTemplates // []) | all(.[];
+                  configured
+                  and startswith("https://")
+                  and contains("{sha}")
+                  and (contains("?") | not)
+                  and (contains("#") | not)
+                ))
+                and (($oauth.frontendRedirectUriTemplates // []) as $templates
+                  | ($templates | unique | length) == ($templates | length))
                 and (if $oauth.provider.type == "oidc" then
                   ($oauth.provider.oidc | type == "object")
-                  and (($oauth.provider | has("orangeauth")) | not)
+                  # AI-REMOVED 2026-08-29:
+                  # Reason: deploy config 需要保留未启用 OrangeAuth 配置，活动适配器继续由 provider.type 唯一选择。
+                  # Trigger: 用户要求切换 Provider 时保留 OIDC 配置数据。
+                  # Evidence: secrets 物化步骤只输出所选适配器 secret，Worker 运行时仍拒绝双适配器环境变量。
+                  # Replacement: provider.type 判别式校验与下方所选 secret 物化。
+                  # Risk: Low
+                  # Human Review: Required
+                  #
+                  # Original code:
+                  # and (($oauth.provider | has("orangeauth")) | not)
                   and ($oauth.provider.oidc.discoveryUrl | configured and startswith("https://") and endswith("/.well-known/openid-configuration"))
                   and ($oauth.provider.oidc.clientId | configured)
                   and ($oauth_secret.OIDC_CLIENT_SECRET | configured)
-                  and (($oauth_secret | has("ORANGEAUTH_CLIENT_SECRET")) | not)
+                  # AI-REMOVED 2026-08-29:
+                  # Reason: deploy config 可以保留未选 OrangeAuth secret，但不得注入 OIDC 模式 Worker。
+                  # Trigger: 用户要求切换 Provider 时保留 OIDC 配置数据。
+                  # Evidence: Materialize environment bindings 按 provider.type 生成最小 oauth-secrets.json。
+                  # Replacement: 下方判别式 oauth-secrets.json 物化。
+                  # Risk: Low
+                  # Human Review: Required
+                  #
+                  # Original code:
+                  # and (($oauth_secret | has("ORANGEAUTH_CLIENT_SECRET")) | not)
                 else
                   ($oauth.provider.orangeauth | type == "object")
-                  and (($oauth.provider | has("oidc")) | not)
+                  # AI-REMOVED 2026-08-29:
+                  # Reason: deploy config 需要保留未启用 OIDC 配置，活动适配器继续由 provider.type 唯一选择。
+                  # Trigger: 用户要求切换 Provider 时保留 OIDC 配置数据。
+                  # Evidence: secrets 物化步骤只输出所选适配器 secret，Worker 运行时仍拒绝双适配器环境变量。
+                  # Replacement: provider.type 判别式校验与下方所选 secret 物化。
+                  # Risk: Low
+                  # Human Review: Required
+                  #
+                  # Original code:
+                  # and (($oauth.provider | has("oidc")) | not)
                   and ($oauth.provider.orangeauth.baseUrl | configured and startswith("https://"))
                   and ($oauth.provider.orangeauth.clientId | configured)
                   and ($oauth.provider.orangeauth.scope == "user.read")
                   and ($oauth_secret.ORANGEAUTH_CLIENT_SECRET | configured)
-                  and (($oauth_secret | has("OIDC_CLIENT_SECRET")) | not)
+                  # AI-REMOVED 2026-08-29:
+                  # Reason: deploy config 可以保留未选 OIDC secret，但不得注入 OrangeAuth 模式 Worker。
+                  # Trigger: 用户要求切换 Provider 时保留 OIDC 配置数据。
+                  # Evidence: Materialize environment bindings 按 provider.type 生成最小 oauth-secrets.json。
+                  # Replacement: 下方判别式 oauth-secrets.json 物化。
+                  # Risk: Low
+                  # Human Review: Required
+                  #
+                  # Original code:
+                  # and (($oauth_secret | has("OIDC_CLIENT_SECRET")) | not)
                 end)
               else true end)
           ' "$config_file" >/dev/null; then
@@ -243,7 +289,43 @@ jobs:
               }
               return url.href;
             });
-            valid = new Set(normalized).size === normalized.length;
+            const templates = target.oauth.frontendRedirectUriTemplates ?? [];
+            if (!Array.isArray(templates) || templates.length > 32) {
+              throw new Error("invalid frontend redirect templates");
+            }
+            const placeholder = "{sha}";
+            const sampleSha = "0".repeat(40);
+            const normalizedTemplates = templates.map((template) => {
+              if (
+                typeof template !== "string"
+                || template.indexOf(placeholder) === -1
+                || template.indexOf(placeholder) !== template.lastIndexOf(placeholder)
+              ) {
+                throw new Error("invalid frontend redirect template");
+              }
+              const url = new URL(template.replace(placeholder, sampleSha));
+              if (
+                url.href.length > 2048
+                || url.protocol !== "https:"
+                || url.username
+                || url.password
+                || url.search
+                || url.hash
+              ) {
+                throw new Error("unsafe frontend redirect template");
+              }
+              const pathSegments = url.pathname.split("/");
+              const shaSegmentIndexes = pathSegments.flatMap((segment, index) => (
+                segment === sampleSha ? [index] : []
+              ));
+              if (shaSegmentIndexes.length !== 1) {
+                throw new Error("frontend redirect template placeholder is not a path segment");
+              }
+              pathSegments[shaSegmentIndexes[0]] = placeholder;
+              return url.origin + pathSegments.join("/");
+            });
+            valid = new Set(normalized).size === normalized.length
+              && new Set(normalizedTemplates).size === normalizedTemplates.length;
           } catch {
             valid = false;
           }
@@ -287,6 +369,7 @@ jobs:
           # echo "OAUTH_FRONTEND_REDIRECT_URI=$(jq -r --arg environment "$CF_ENVIRONMENT" '.[$environment].oauth.frontendRedirectUri // .[$environment].oauth.redirectUri' "$config_file")" >> "$GITHUB_ENV"
           if [ "$(jq -r --arg environment "$CF_ENVIRONMENT" '.[$environment].flags.enableOAuth' "$config_file")" = 'true' ]; then
             echo "OAUTH_FRONTEND_REDIRECT_URIS=$(jq -c --arg environment "$CF_ENVIRONMENT" '.[$environment].oauth.frontendRedirectUris' "$config_file")" >> "$GITHUB_ENV"
+            echo "OAUTH_FRONTEND_REDIRECT_URI_TEMPLATES=$(jq -c --arg environment "$CF_ENVIRONMENT" '.[$environment].oauth.frontendRedirectUriTemplates // []' "$config_file")" >> "$GITHUB_ENV"
           fi
           echo "IDENTITY_D1_ID=$(jq -r --arg environment "$CF_ENVIRONMENT" '.[$environment].d1.identityDatabaseId' "$config_file")" >> "$GITHUB_ENV"
           echo "OAUTH_D1_ID=$(jq -r --arg environment "$CF_ENVIRONMENT" '.[$environment].d1.oauthDatabaseId' "$config_file")" >> "$GITHUB_ENV"
@@ -304,7 +387,27 @@ jobs:
           fi
           jq -c --arg environment "$CF_ENVIRONMENT" '.[$environment].secrets.identity' "$DEPLOY_CONFIG_FILE" > "$RUNNER_TEMP/identity-secrets.json"
           if [ "$OAUTH_ENABLED" = 'true' ]; then
-            jq -c --arg environment "$CF_ENVIRONMENT" '.[$environment].secrets.oauth' "$DEPLOY_CONFIG_FILE" > "$RUNNER_TEMP/oauth-secrets.json"
+            # AI-REMOVED 2026-08-29:
+            # Reason: deploy config 可保留未选适配器 secret，整对象物化会把两个 secret 同时注入 Worker 并触发 fail-closed。
+            # Trigger: 用户要求切换 Provider 时保留 OIDC 配置数据。
+            # Evidence: oauth-worker configuredProvider 拒绝同时出现 OIDC 与 OrangeAuth 环境变量。
+            # Replacement: 下方按 OAUTH_PROVIDER_TYPE 物化 INTERNAL_SERVICE_SECRET 与唯一所选 client secret。
+            # Risk: Low
+            # Human Review: Required
+            #
+            # Original code:
+            # jq -c --arg environment "$CF_ENVIRONMENT" '.[$environment].secrets.oauth' "$DEPLOY_CONFIG_FILE" > "$RUNNER_TEMP/oauth-secrets.json"
+            if [ "$OAUTH_PROVIDER_TYPE" = 'oidc' ]; then
+              jq -c --arg environment "$CF_ENVIRONMENT" '{
+                INTERNAL_SERVICE_SECRET: .[$environment].secrets.oauth.INTERNAL_SERVICE_SECRET,
+                OIDC_CLIENT_SECRET: .[$environment].secrets.oauth.OIDC_CLIENT_SECRET
+              }' "$DEPLOY_CONFIG_FILE" > "$RUNNER_TEMP/oauth-secrets.json"
+            else
+              jq -c --arg environment "$CF_ENVIRONMENT" '{
+                INTERNAL_SERVICE_SECRET: .[$environment].secrets.oauth.INTERNAL_SERVICE_SECRET,
+                ORANGEAUTH_CLIENT_SECRET: .[$environment].secrets.oauth.ORANGEAUTH_CLIENT_SECRET
+              }' "$DEPLOY_CONFIG_FILE" > "$RUNNER_TEMP/oauth-secrets.json"
+            fi
           else
             jq -c --arg environment "$CF_ENVIRONMENT" '{
               INTERNAL_SERVICE_SECRET: .[$environment].secrets.oauth.INTERNAL_SERVICE_SECRET
@@ -336,6 +439,44 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          oauth_environment_args=()
+          if [ "$CF_ENVIRONMENT" = 'beta' ]; then
+            oauth_environment_args=(--env beta)
+          fi
+
+          normalize_oauth_provider_secrets() {
+            local secret_list_file="$RUNNER_TEMP/oauth-runtime-secrets.json"
+            local secret_name
+            local inactive_secrets=()
+
+            if [ "$OAUTH_ENABLED" = 'true' ]; then
+              if [ "$OAUTH_PROVIDER_TYPE" = 'oidc' ]; then
+                inactive_secrets=(ORANGEAUTH_CLIENT_SECRET)
+              else
+                inactive_secrets=(OIDC_CLIENT_SECRET)
+              fi
+            else
+              inactive_secrets=(OIDC_CLIENT_SECRET ORANGEAUTH_CLIENT_SECRET)
+            fi
+
+            pnpm --filter @industrial/oauth exec -- npx wrangler secret list \
+              "${oauth_environment_args[@]}" > "$secret_list_file"
+            for secret_name in "${inactive_secrets[@]}"; do
+              if jq -e --arg secret_name "$secret_name" \
+                'map(.name) | index($secret_name) != null' "$secret_list_file" >/dev/null; then
+                CI=true pnpm --filter @industrial/oauth exec -- npx wrangler secret delete \
+                  "$secret_name" "${oauth_environment_args[@]}"
+              fi
+            done
+
+            pnpm --filter @industrial/oauth exec -- npx wrangler secret list \
+              "${oauth_environment_args[@]}" > "$secret_list_file"
+            for secret_name in "${inactive_secrets[@]}"; do
+              jq -e --arg secret_name "$secret_name" \
+                'map(.name) | index($secret_name) == null' "$secret_list_file" >/dev/null
+            done
+          }
+
           if [ "$CF_ENVIRONMENT" = 'beta' ]; then
             pnpm --filter @industrial/identity exec -- npx wrangler deploy --env beta --secrets-file "$RUNNER_TEMP/identity-secrets.json"
             # AI-REMOVED 2026-08-24:
@@ -355,7 +496,8 @@ jobs:
                   --var "OIDC_DISCOVERY_URL:$OIDC_DISCOVERY_URL" \
                   --var "OIDC_CLIENT_ID:$OIDC_CLIENT_ID" \
                   --var "OAUTH_REDIRECT_URI:$OAUTH_REDIRECT_URI" \
-                  --var "OAUTH_FRONTEND_REDIRECT_URIS:$OAUTH_FRONTEND_REDIRECT_URIS"
+                  --var "OAUTH_FRONTEND_REDIRECT_URIS:$OAUTH_FRONTEND_REDIRECT_URIS" \
+                  --var "OAUTH_FRONTEND_REDIRECT_URI_TEMPLATES:$OAUTH_FRONTEND_REDIRECT_URI_TEMPLATES"
               else
                 pnpm --filter @industrial/oauth exec -- npx wrangler deploy --env beta \
                   --secrets-file "$RUNNER_TEMP/oauth-secrets.json" \
@@ -365,13 +507,16 @@ jobs:
                   --var "ORANGEAUTH_CLIENT_ID:$ORANGEAUTH_CLIENT_ID" \
                   --var "ORANGEAUTH_SCOPE:$ORANGEAUTH_SCOPE" \
                   --var "OAUTH_REDIRECT_URI:$OAUTH_REDIRECT_URI" \
-                  --var "OAUTH_FRONTEND_REDIRECT_URIS:$OAUTH_FRONTEND_REDIRECT_URIS"
+                  --var "OAUTH_FRONTEND_REDIRECT_URIS:$OAUTH_FRONTEND_REDIRECT_URIS" \
+                  --var "OAUTH_FRONTEND_REDIRECT_URI_TEMPLATES:$OAUTH_FRONTEND_REDIRECT_URI_TEMPLATES"
               fi
             else
               pnpm --filter @industrial/oauth exec -- npx wrangler deploy --env beta \
                 --secrets-file "$RUNNER_TEMP/oauth-secrets.json" \
                 --var "OAUTH_ENABLED:false"
             fi
+            # Wrangler --secrets-file 为增量语义；Provider 切换后必须显式移除未选 secret，避免运行时双适配器 fail-closed。
+            normalize_oauth_provider_secrets
             pnpm --filter @industrial/sync exec -- npx wrangler deploy --env beta \
               --secrets-file "$RUNNER_TEMP/sync-secrets.json" \
               --var "ALLOW_ANONYMOUS_SPACES:$ALLOW_ANONYMOUS_SPACES"
@@ -412,7 +557,8 @@ jobs:
                   --var "OIDC_DISCOVERY_URL:$OIDC_DISCOVERY_URL" \
                   --var "OIDC_CLIENT_ID:$OIDC_CLIENT_ID" \
                   --var "OAUTH_REDIRECT_URI:$OAUTH_REDIRECT_URI" \
-                  --var "OAUTH_FRONTEND_REDIRECT_URIS:$OAUTH_FRONTEND_REDIRECT_URIS"
+                  --var "OAUTH_FRONTEND_REDIRECT_URIS:$OAUTH_FRONTEND_REDIRECT_URIS" \
+                  --var "OAUTH_FRONTEND_REDIRECT_URI_TEMPLATES:$OAUTH_FRONTEND_REDIRECT_URI_TEMPLATES"
               else
                 pnpm --filter @industrial/oauth exec -- npx wrangler deploy \
                   --secrets-file "$RUNNER_TEMP/oauth-secrets.json" \
@@ -422,13 +568,16 @@ jobs:
                   --var "ORANGEAUTH_CLIENT_ID:$ORANGEAUTH_CLIENT_ID" \
                   --var "ORANGEAUTH_SCOPE:$ORANGEAUTH_SCOPE" \
                   --var "OAUTH_REDIRECT_URI:$OAUTH_REDIRECT_URI" \
-                  --var "OAUTH_FRONTEND_REDIRECT_URIS:$OAUTH_FRONTEND_REDIRECT_URIS"
+                  --var "OAUTH_FRONTEND_REDIRECT_URIS:$OAUTH_FRONTEND_REDIRECT_URIS" \
+                  --var "OAUTH_FRONTEND_REDIRECT_URI_TEMPLATES:$OAUTH_FRONTEND_REDIRECT_URI_TEMPLATES"
               fi
             else
               pnpm --filter @industrial/oauth exec -- npx wrangler deploy \
                 --secrets-file "$RUNNER_TEMP/oauth-secrets.json" \
                 --var "OAUTH_ENABLED:false"
             fi
+            # Wrangler --secrets-file 为增量语义；Provider 切换后必须显式移除未选 secret，避免运行时双适配器 fail-closed。
+            normalize_oauth_provider_secrets
             pnpm --filter @industrial/sync exec -- npx wrangler deploy \
               --secrets-file "$RUNNER_TEMP/sync-secrets.json" \
               --var "ALLOW_ANONYMOUS_SPACES:$ALLOW_ANONYMOUS_SPACES"

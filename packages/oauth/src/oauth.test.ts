@@ -22,6 +22,11 @@ const ORANGEAUTH_CLIENT_ID = "orangeauth-test-client";
 const ORANGEAUTH_CLIENT_SECRET = "orangeauth-test-secret";
 const FRONTEND_REDIRECT_URI = "https://frontend.test/oauth/callback";
 const SECOND_FRONTEND_REDIRECT_URI = "https://preview.test/oauth/callback";
+const ALPHA_FRONTEND_REDIRECT_URI_TEMPLATE =
+  "https://alpha.frontend.test/{sha}/auth/callback";
+const ALPHA_DEPLOYMENT_SHA = "6cb283a95b030b07473e250ad8d0ef98a33c30aa";
+const ALPHA_FRONTEND_REDIRECT_URI =
+  `https://alpha.frontend.test/${ALPHA_DEPLOYMENT_SHA}/auth/callback`;
 const LOOPBACK_FRONTEND_REDIRECT_URIS = [
   "http://localhost:4174/auth/callback",
   "http://127.0.0.1:4174/auth/callback",
@@ -324,6 +329,9 @@ beforeAll(async () => {
       SECOND_FRONTEND_REDIRECT_URI,
       ...LOOPBACK_FRONTEND_REDIRECT_URIS,
     ]),
+    OAUTH_FRONTEND_REDIRECT_URI_TEMPLATES: JSON.stringify([
+      ALPHA_FRONTEND_REDIRECT_URI_TEMPLATE,
+    ]),
     INTERNAL_SERVICE_SECRET: INTERNAL_SECRET,
     OAUTH_CALLBACK_CODE_TTL_SECONDS: "60",
   };
@@ -476,6 +484,42 @@ describe("身份 Provider 登录闭环", () => {
     },
   );
 
+  it("允许严格 {sha} 模板匹配 Alpha 完成页并返回实际版本路径", async () => {
+    const { state } = await authorize(ALPHA_FRONTEND_REDIRECT_URI);
+    const response = await callback(state);
+    expect(response.status).toBe(303);
+    const redirect = new URL(response.headers.get("location") ?? "");
+    expect(`${redirect.origin}${redirect.pathname}`).toBe(ALPHA_FRONTEND_REDIRECT_URI);
+    expect(redirect.search).toBe("");
+    const fragment = new URLSearchParams(redirect.hash.slice(1));
+    expect(fragment.get("oauth_channel")).toBe(OAUTH_CHANNEL);
+    expect(fragment.get("code")).not.toBe("");
+  });
+
+  it("拒绝不满足 Alpha SHA 模板边界的完成页", async () => {
+    const invalidUris = [
+      "https://alpha.frontend.test/6cb283a95b030b07473e250ad8d0ef98a33c30a/auth/callback",
+      "https://alpha.frontend.test/6CB283A95B030B07473E250AD8D0EF98A33C30AA/auth/callback",
+      "https://alpha.frontend.test/6cb283a95b030b07473e250ad8d0ef98a33c30ag/auth/callback",
+      `https://alpha.frontend.test/${ALPHA_DEPLOYMENT_SHA}/nested/auth/callback`,
+      `https://alpha.frontend.test/prefix-${ALPHA_DEPLOYMENT_SHA}/auth/callback`,
+      `https://alpha.frontend.test.attacker.test/${ALPHA_DEPLOYMENT_SHA}/auth/callback`,
+      `http://alpha.frontend.test/${ALPHA_DEPLOYMENT_SHA}/auth/callback`,
+      `${ALPHA_FRONTEND_REDIRECT_URI}?next=https://attacker.test`,
+      `${ALPHA_FRONTEND_REDIRECT_URI}#fragment`,
+    ];
+    for (const frontendRedirectUri of invalidUris) {
+      const parameters = new URLSearchParams({
+        frontend_redirect_uri: frontendRedirectUri,
+        oauth_channel: OAUTH_CHANNEL,
+      });
+      const response = await request(`/v1/oauth/authorize?${parameters.toString()}`);
+      expect(response.status).toBe(400);
+      expect(await response.json()).toMatchObject({ error: "oauth_frontend_invalid" });
+    }
+    expect(provider.requests).toEqual([]);
+  });
+
   it("不在 allowlist 的前端地址在访问 Provider 前被拒绝", async () => {
     const invalidUris = [
       "https://attacker.test/oauth/callback",
@@ -515,12 +559,50 @@ describe("身份 Provider 登录闭环", () => {
     expect(provider.requests).toEqual([]);
   });
 
+  it("SHA 模板配置只接受 HTTPS URL 中的唯一完整路径段", async () => {
+    const saved = env.OAUTH_FRONTEND_REDIRECT_URI_TEMPLATES;
+    const invalidTemplates = [
+      "https://alpha.frontend.test/*/auth/callback",
+      "https://{sha}.frontend.test/auth/callback",
+      "https://alpha.frontend.test/prefix-{sha}/auth/callback",
+      "https://alpha.frontend.test/{sha}/{sha}/auth/callback",
+      "http://localhost/{sha}/auth/callback",
+      "https://alpha.frontend.test/{sha}/auth/callback?next=/",
+    ];
+    try {
+      for (const template of invalidTemplates) {
+        env.OAUTH_FRONTEND_REDIRECT_URI_TEMPLATES = JSON.stringify([template]);
+        const parameters = new URLSearchParams({
+          frontend_redirect_uri: ALPHA_FRONTEND_REDIRECT_URI,
+          oauth_channel: OAUTH_CHANNEL,
+        });
+        const response = await request(`/v1/oauth/authorize?${parameters.toString()}`);
+        expect(response.status).toBe(500);
+        expect(await response.json()).toMatchObject({ error: "configuration_error" });
+      }
+    } finally {
+      env.OAUTH_FRONTEND_REDIRECT_URI_TEMPLATES = saved;
+    }
+    expect(provider.requests).toEqual([]);
+  });
+
   it("登录期间从 allowlist 撤销目标后不再跳转", async () => {
     const { state } = await authorize(SECOND_FRONTEND_REDIRECT_URI);
     const saved = env.OAUTH_FRONTEND_REDIRECT_URIS;
     env.OAUTH_FRONTEND_REDIRECT_URIS = JSON.stringify([FRONTEND_REDIRECT_URI]);
     const response = await callback(state);
     env.OAUTH_FRONTEND_REDIRECT_URIS = saved;
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ error: "oauth_state_invalid" });
+    expect(provider.tokenRequests).toBe(0);
+  });
+
+  it("登录期间撤销 SHA 模板后不再跳转", async () => {
+    const { state } = await authorize(ALPHA_FRONTEND_REDIRECT_URI);
+    const saved = env.OAUTH_FRONTEND_REDIRECT_URI_TEMPLATES;
+    env.OAUTH_FRONTEND_REDIRECT_URI_TEMPLATES = "[]";
+    const response = await callback(state);
+    env.OAUTH_FRONTEND_REDIRECT_URI_TEMPLATES = saved;
     expect(response.status).toBe(400);
     expect(await response.json()).toMatchObject({ error: "oauth_state_invalid" });
     expect(provider.tokenRequests).toBe(0);

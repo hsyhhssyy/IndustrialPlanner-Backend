@@ -15,9 +15,13 @@
       "enableOAuth": false
     },
     "oauth": {
-      "_comment": "OAuth 当前关闭；以下 OrangeAuth 配置只展示未来启用形态，不会在关闭时注入 Worker",
+      "_comment": "OAuth 当前关闭；配置可保留两个适配器数据，未来由 type 唯一选择并只注入所选项",
       "provider": {
         "type": "orangeauth",
+        "oidc": {
+          "discoveryUrl": "<stable-oidc-discovery-url>",
+          "clientId": "<stable-oidc-client-id>"
+        },
         "orangeauth": {
           "baseUrl": "https://auth.yituliu.cn",
           "clientId": "<stable-orangeauth-client-id>",
@@ -27,6 +31,9 @@
       "redirectUri": "<stable-oauth-redirect-uri>",
       "frontendRedirectUris": [
         "<stable-frontend-oauth-landing-uri>"
+      ],
+      "frontendRedirectUriTemplates": [
+        "https://alpha.example.com/{sha}/auth/callback"
       ]
     },
     "d1": {
@@ -50,6 +57,7 @@
         "INTERNAL_SERVICE_SECRET": "<secret>"
       },
       "oauth": {
+        "OIDC_CLIENT_SECRET": "<secret>",
         "ORANGEAUTH_CLIENT_SECRET": "<secret>",
         "INTERNAL_SERVICE_SECRET": "<secret>"
       }
@@ -67,12 +75,17 @@
       "enableOAuth": true
     },
     "oauth": {
-      "_comment": "当前选择标准 OIDC；同一环境不得再提供 orangeauth 配置块",
+      "_comment": "当前示例选择 OrangeAuth；保留 OIDC 数据不等于启用，部署只注入 type 所选配置",
       "provider": {
-        "type": "oidc",
+        "type": "orangeauth",
         "oidc": {
           "discoveryUrl": "<beta-oidc-discovery-url>",
           "clientId": "<beta-oidc-client-id>"
+        },
+        "orangeauth": {
+          "baseUrl": "https://auth.yituliu.cn",
+          "clientId": "<beta-orangeauth-client-id>",
+          "scope": "user.read"
         }
       },
       "redirectUri": "<beta-oauth-redirect-uri>",
@@ -82,6 +95,9 @@
         "<beta-frontend-oauth-landing-uri>",
         "http://localhost:4174/auth/callback",
         "http://127.0.0.1:4174/auth/callback"
+      ],
+      "frontendRedirectUriTemplates": [
+        "https://alpha.example.com/{sha}/auth/callback"
       ]
     },
     "d1": {
@@ -106,6 +122,7 @@
       },
       "oauth": {
         "OIDC_CLIENT_SECRET": "<secret>",
+        "ORANGEAUTH_CLIENT_SECRET": "<secret>",
         "INTERNAL_SERVICE_SECRET": "<secret>"
       }
     },

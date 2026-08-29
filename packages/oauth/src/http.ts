@@ -12,7 +12,10 @@ import type {
   LoginProviderType,
 } from "./provider";
 import { LoginProviderConfigurationError } from "./provider";
-import { normalizeFrontendRedirectUri } from "./model";
+import {
+  normalizeFrontendRedirectUri,
+  normalizeFrontendRedirectUriTemplate,
+} from "./model";
 import { createOAuthRepository } from "./repository";
 import {
   OAuthServiceError,
@@ -47,6 +50,7 @@ export interface OAuthEnv {
   // Original code:
   // OAUTH_FRONTEND_REDIRECT_URI?: string;
   OAUTH_FRONTEND_REDIRECT_URIS?: string;
+  OAUTH_FRONTEND_REDIRECT_URI_TEMPLATES?: string;
   INTERNAL_SERVICE_SECRET?: string;
   OAUTH_LOGIN_TTL_SECONDS?: string;
   OAUTH_CALLBACK_CODE_TTL_SECONDS?: string;
@@ -159,6 +163,40 @@ function configuredFrontendRedirectUris(value: string | undefined): string[] {
   return uris;
 }
 
+function configuredFrontendRedirectUriTemplates(value: string | undefined): string[] {
+  if (value === undefined) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    throw new LoginProviderConfigurationError(
+      "OAUTH_FRONTEND_REDIRECT_URI_TEMPLATES 不是合法 JSON",
+    );
+  }
+  if (
+    !Array.isArray(parsed)
+    || parsed.length > 32
+    || !parsed.every((item) => typeof item === "string")
+  ) {
+    throw new LoginProviderConfigurationError(
+      "OAUTH_FRONTEND_REDIRECT_URI_TEMPLATES 必须是字符串数组",
+    );
+  }
+  const normalized = parsed.map((item) => normalizeFrontendRedirectUriTemplate(item));
+  if (normalized.some((item) => item === null)) {
+    throw new LoginProviderConfigurationError(
+      "OAUTH_FRONTEND_REDIRECT_URI_TEMPLATES 包含不安全模板",
+    );
+  }
+  const templates = normalized as string[];
+  if (new Set(templates).size !== templates.length) {
+    throw new LoginProviderConfigurationError(
+      "OAUTH_FRONTEND_REDIRECT_URI_TEMPLATES 包含重复模板",
+    );
+  }
+  return templates;
+}
+
 // AI-REMOVED 2026-08-24:
 // Reason: 单一前端 query redirect 被多前端精确 allowlist 与 fragment 完成协议替代。
 // Trigger: 用户明确要求 dev、pre、beta 共用 Beta 后端，且不保留旧 Beta callback 兼容。
@@ -203,6 +241,9 @@ function dependencies(env: OAuthEnv, options: OAuthAppOptions): OAuthServiceDepe
       required(env.INTERNAL_SERVICE_SECRET, "INTERNAL_SERVICE_SECRET"),
     ),
     frontendRedirectUris: configuredFrontendRedirectUris(env.OAUTH_FRONTEND_REDIRECT_URIS),
+    frontendRedirectUriTemplates: configuredFrontendRedirectUriTemplates(
+      env.OAUTH_FRONTEND_REDIRECT_URI_TEMPLATES,
+    ),
     loginTtlSeconds: optionalPositiveInteger(env.OAUTH_LOGIN_TTL_SECONDS),
     callbackCodeTtlSeconds: optionalPositiveInteger(env.OAUTH_CALLBACK_CODE_TTL_SECONDS),
     now: options.now,
