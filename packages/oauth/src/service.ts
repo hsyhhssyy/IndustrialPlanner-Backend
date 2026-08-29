@@ -5,7 +5,8 @@ import {
   normalizeFrontendRedirectUri,
   type OAuthLoginTransaction,
 } from "./model";
-import type { OidcClient } from "./oidc";
+import type { LoginIdentityProvider } from "./provider";
+import { LoginProviderProtocolError } from "./provider";
 import type { OAuthRepository } from "./repository";
 
 const DEFAULT_LOGIN_TTL_SECONDS = 10 * 60;
@@ -13,7 +14,7 @@ const DEFAULT_CALLBACK_CODE_TTL_SECONDS = 60;
 
 export interface OAuthServiceDependencies {
   repository: OAuthRepository;
-  oidc: OidcClient;
+  provider: LoginIdentityProvider;
   identity: IdentityClient;
   frontendRedirectUris: readonly string[];
   loginTtlSeconds?: number;
@@ -50,7 +51,8 @@ export class OAuthServiceError extends Error {
       | "oauth_channel_invalid"
       | "configuration_error"
       | "identity_unavailable"
-      | "oidc_provider_unavailable",
+      | "oauth_provider_unavailable"
+      | "oauth_access_denied",
     message: string,
     public readonly frontendTarget?: OAuthFrontendTarget,
   ) {
@@ -95,10 +97,29 @@ export async function beginAuthorization(
   );
   let request;
   try {
-    request = await dependencies.oidc.createAuthorizationRequest();
+    request = await dependencies.provider.createAuthorizationRequest();
   } catch (error) {
     if (error instanceof OAuthServiceError) throw error;
-    throw new OAuthServiceError(502, "oidc_provider_unavailable", "OIDC Provider 不可用");
+    if (error instanceof LoginProviderProtocolError && error.kind === "configuration") {
+      throw new OAuthServiceError(500, "configuration_error", "登录身份 Provider 配置无效");
+    }
+    throw new OAuthServiceError(
+      502,
+      "oauth_provider_unavailable",
+      "登录身份 Provider 不可用",
+    );
+  }
+  if (
+    !/^[A-Za-z0-9_-]{22,512}$/u.test(request.state)
+    || !/^[A-Za-z0-9._~-]{43,128}$/u.test(request.codeVerifier)
+    || request.validationContext.length > 2048
+    || /[\u0000-\u001F\u007F]/u.test(request.validationContext)
+  ) {
+    throw new OAuthServiceError(
+      500,
+      "configuration_error",
+      "登录身份 Provider 校验上下文无效",
+    );
   }
 
   const now = (dependencies.now ?? Date.now)();
@@ -106,7 +127,8 @@ export async function beginAuthorization(
     stateHash: await sha256Hex(request.state),
     stateValue: request.state,
     codeVerifier: request.codeVerifier,
-    nonce: request.nonce,
+    providerType: dependencies.provider.type,
+    providerContext: request.validationContext,
     frontendRedirectUri: frontendTarget.frontendRedirectUri,
     oauthChannel: frontendTarget.oauthChannel,
     createdAt: timestamp(now),
@@ -181,25 +203,60 @@ export async function completeCallback(
     throw new OAuthServiceError(400, "oauth_state_invalid", "OAuth state 无效或已过期");
   }
 
-  let oidcIdentity;
-  try {
-    oidcIdentity = await dependencies.oidc.exchangeCallback(callbackUrl, {
-      state: transaction.stateValue,
-      codeVerifier: transaction.codeVerifier,
-      nonce: transaction.nonce,
-    });
-  } catch {
+  if (transaction.providerType !== dependencies.provider.type) {
     throw new OAuthServiceError(
       400,
       "oauth_callback_invalid",
-      "OIDC 回调验证失败",
+      "OAuth 回调验证失败",
+      frontendTarget,
+    );
+  }
+  if (callbackUrl.searchParams.get("error") === "access_denied") {
+    throw new OAuthServiceError(
+      400,
+      "oauth_access_denied",
+      "用户取消 OAuth 授权",
+      frontendTarget,
+    );
+  }
+
+  let providerIdentity;
+  try {
+    providerIdentity = await dependencies.provider.exchangeCallback(callbackUrl, {
+      state: transaction.stateValue,
+      codeVerifier: transaction.codeVerifier,
+      validationContext: transaction.providerContext,
+    });
+  } catch (error) {
+    if (error instanceof LoginProviderProtocolError) {
+      if (error.kind === "configuration") {
+        throw new OAuthServiceError(
+          500,
+          "configuration_error",
+          "登录身份 Provider 配置无效",
+          frontendTarget,
+        );
+      }
+      if (error.kind === "unavailable") {
+        throw new OAuthServiceError(
+          502,
+          "oauth_provider_unavailable",
+          "登录身份 Provider 不可用",
+          frontendTarget,
+        );
+      }
+    }
+    throw new OAuthServiceError(
+      400,
+      "oauth_callback_invalid",
+      "OAuth 回调验证失败",
       frontendTarget,
     );
   }
 
   let mapping = await dependencies.repository.findMapping(
-    oidcIdentity.issuer,
-    oidcIdentity.subject,
+    providerIdentity.providerKey,
+    providerIdentity.subject,
   );
   if (!mapping) {
     let created;
@@ -214,8 +271,8 @@ export async function completeCallback(
       );
     }
     mapping = await dependencies.repository.createMappingIfAbsent({
-      issuer: oidcIdentity.issuer,
-      subject: oidcIdentity.subject,
+      providerKey: providerIdentity.providerKey,
+      subject: providerIdentity.subject,
       accountId: created.accountId,
       createdAt: consumedAt,
     });
@@ -229,7 +286,7 @@ export async function completeCallback(
   await dependencies.repository.createCallbackCode({
     codeHash: await sha256Hex(code),
     accountId: mapping.accountId,
-    username: oidcIdentity.username,
+    username: providerIdentity.username,
     expiresAt: timestamp(now + callbackTtl * 1000),
     consumedAt: null,
     createdAt: consumedAt,

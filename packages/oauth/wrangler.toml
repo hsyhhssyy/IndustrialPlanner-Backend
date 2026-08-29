@@ -1,5 +1,6 @@
 # OAuth Worker — 第三方登录与授权（空壳）
 # AI-CORRECTION 2026-08-23: Stage 2 启用配置化 OIDC 登录，仅由 gateway 通过 Service Binding 暴露。
+# AI-CORRECTION 2026-08-29: Stage 2 M8 由部署参数唯一选择 OIDC 或 OrangeAuth 登录适配器，公网边界仍只经过 gateway。
 name = "industrial-oauth"
 main = "src/index.ts"
 compatibility_date = "2025-08-06"

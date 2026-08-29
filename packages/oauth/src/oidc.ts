@@ -9,6 +9,13 @@ import {
   randomState,
   type Configuration,
 } from "openid-client";
+import type {
+  LoginIdentityProvider,
+  LoginProviderAuthorizationRequest,
+  LoginProviderFetch,
+  LoginProviderIdentity,
+} from "./provider";
+import { LoginProviderConfigurationError } from "./provider";
 
 const DISCOVERY_SUFFIX = "/.well-known/openid-configuration";
 
@@ -19,30 +26,17 @@ export interface OidcSettings {
   redirectUri: string;
 }
 
-export interface OidcAuthorizationRequest {
-  authorizationUrl: URL;
-  state: string;
-  codeVerifier: string;
-  nonce: string;
+export type OidcAuthorizationRequest = LoginProviderAuthorizationRequest;
+
+export type OidcIdentity = LoginProviderIdentity;
+
+export interface OidcClient extends LoginIdentityProvider {
+  readonly type: "oidc";
 }
 
-export interface OidcIdentity {
-  issuer: string;
-  subject: string;
-  username: string;
-}
+export type OidcFetch = LoginProviderFetch;
 
-export interface OidcClient {
-  createAuthorizationRequest(): Promise<OidcAuthorizationRequest>;
-  exchangeCallback(
-    callbackUrl: URL,
-    expected: { state: string; codeVerifier: string; nonce: string },
-  ): Promise<OidcIdentity>;
-}
-
-export type OidcFetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
-
-export class OidcConfigurationError extends Error {
+export class OidcConfigurationError extends LoginProviderConfigurationError {
   public constructor(message: string) {
     super(message);
     this.name = "OidcConfigurationError";
@@ -82,7 +76,7 @@ function validateSettings(settings: OidcSettings): { issuer: URL; redirectUri: U
     throw new OidcConfigurationError("OIDC_CLIENT_SECRET 不能为空");
   }
   const issuer = issuerFromDiscoveryUrl(settings.discoveryUrl);
-  const redirectUri = parseHttpsUrl(settings.redirectUri, "OIDC_REDIRECT_URI");
+  const redirectUri = parseHttpsUrl(settings.redirectUri, "OAUTH_REDIRECT_URI");
   return { issuer, redirectUri };
 }
 
@@ -115,6 +109,8 @@ export function createOidcClient(settings: OidcSettings, fetchImpl?: OidcFetch):
   }
 
   return {
+    type: "oidc",
+
     async createAuthorizationRequest() {
       const state = randomState();
       const codeVerifier = randomPKCECodeVerifier();
@@ -129,7 +125,7 @@ export function createOidcClient(settings: OidcSettings, fetchImpl?: OidcFetch):
         code_challenge: codeChallenge,
         code_challenge_method: "S256",
       });
-      return { authorizationUrl, state, codeVerifier, nonce };
+      return { authorizationUrl, state, codeVerifier, validationContext: nonce };
     },
 
     async exchangeCallback(callbackUrl, expected) {
@@ -137,7 +133,7 @@ export function createOidcClient(settings: OidcSettings, fetchImpl?: OidcFetch):
       verifiedCallbackUrl.search = callbackUrl.search;
       const tokens = await authorizationCodeGrant(await configuration(), verifiedCallbackUrl, {
         expectedState: expected.state,
-        expectedNonce: expected.nonce,
+        expectedNonce: expected.validationContext,
         pkceCodeVerifier: expected.codeVerifier,
         idTokenExpected: true,
       });
@@ -153,7 +149,7 @@ export function createOidcClient(settings: OidcSettings, fetchImpl?: OidcFetch):
       ) {
         throw new Error("OIDC id_token 缺少 iss、sub 或 preferred_username");
       }
-      return { issuer: claims.iss, subject: claims.sub, username };
+      return { providerKey: claims.iss, subject: claims.sub, username };
     },
   };
 }

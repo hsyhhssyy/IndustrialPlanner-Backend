@@ -3,11 +3,15 @@ import type { IdentityBinding } from "./identity-client";
 import { createIdentityClient, IdentityClientError } from "./identity-client";
 import {
   createOidcClient,
-  OidcConfigurationError,
-  type OidcClient,
-  type OidcFetch,
   type OidcSettings,
 } from "./oidc";
+import { createOrangeAuthProvider, type OrangeAuthSettings } from "./orangeauth";
+import type {
+  LoginIdentityProvider,
+  LoginProviderFetch,
+  LoginProviderType,
+} from "./provider";
+import { LoginProviderConfigurationError } from "./provider";
 import { normalizeFrontendRedirectUri } from "./model";
 import { createOAuthRepository } from "./repository";
 import {
@@ -23,10 +27,15 @@ export interface OAuthEnv {
   IDENTITY: IdentityBinding;
   ENVIRONMENT?: string;
   OAUTH_ENABLED?: string;
+  OAUTH_PROVIDER_TYPE?: string;
   OIDC_DISCOVERY_URL?: string;
   OIDC_CLIENT_ID?: string;
   OIDC_CLIENT_SECRET?: string;
-  OIDC_REDIRECT_URI?: string;
+  ORANGEAUTH_BASE_URL?: string;
+  ORANGEAUTH_CLIENT_ID?: string;
+  ORANGEAUTH_CLIENT_SECRET?: string;
+  ORANGEAUTH_SCOPE?: string;
+  OAUTH_REDIRECT_URI?: string;
   // AI-REMOVED 2026-08-24:
   // Reason: Beta 后端需要服务 dev、pre、beta 三个精确前端 callback，单一地址无法表达真实拓扑。
   // Trigger: 用户明确要求前端携带完整 URL 并由后端执行 allowlist，不保留 Beta 旧协议兼容。
@@ -44,8 +53,11 @@ export interface OAuthEnv {
 }
 
 export interface OAuthAppOptions {
-  oidcFetch?: OidcFetch;
-  createOidc?: (settings: OidcSettings) => OidcClient;
+  providerFetch?: LoginProviderFetch;
+  createProvider?: (
+    type: LoginProviderType,
+    settings: OidcSettings | OrangeAuthSettings,
+  ) => LoginIdentityProvider;
   now?: () => number;
   createCallbackCode?: () => string;
 }
@@ -63,7 +75,7 @@ function oauthEnabled(value: string | undefined): boolean | null {
 }
 
 function required(value: string | undefined, name: string): string {
-  if (!value?.trim()) throw new OidcConfigurationError(`${name} 不能为空`);
+  if (!value?.trim()) throw new LoginProviderConfigurationError(`${name} 不能为空`);
   return value;
 }
 
@@ -72,8 +84,52 @@ function oidcSettings(env: OAuthEnv): OidcSettings {
     discoveryUrl: required(env.OIDC_DISCOVERY_URL, "OIDC_DISCOVERY_URL"),
     clientId: required(env.OIDC_CLIENT_ID, "OIDC_CLIENT_ID"),
     clientSecret: required(env.OIDC_CLIENT_SECRET, "OIDC_CLIENT_SECRET"),
-    redirectUri: required(env.OIDC_REDIRECT_URI, "OIDC_REDIRECT_URI"),
+    redirectUri: required(env.OAUTH_REDIRECT_URI, "OAUTH_REDIRECT_URI"),
   };
+}
+
+function orangeAuthSettings(env: OAuthEnv): OrangeAuthSettings {
+  return {
+    baseUrl: required(env.ORANGEAUTH_BASE_URL, "ORANGEAUTH_BASE_URL"),
+    clientId: required(env.ORANGEAUTH_CLIENT_ID, "ORANGEAUTH_CLIENT_ID"),
+    clientSecret: required(env.ORANGEAUTH_CLIENT_SECRET, "ORANGEAUTH_CLIENT_SECRET"),
+    redirectUri: required(env.OAUTH_REDIRECT_URI, "OAUTH_REDIRECT_URI"),
+    scope: required(env.ORANGEAUTH_SCOPE, "ORANGEAUTH_SCOPE"),
+  };
+}
+
+function hasDefinedValue(values: Array<string | undefined>): boolean {
+  return values.some((value) => value !== undefined);
+}
+
+function configuredProvider(env: OAuthEnv, options: OAuthAppOptions): LoginIdentityProvider {
+  const type = required(env.OAUTH_PROVIDER_TYPE, "OAUTH_PROVIDER_TYPE");
+  if (type === "oidc") {
+    if (hasDefinedValue([
+      env.ORANGEAUTH_BASE_URL,
+      env.ORANGEAUTH_CLIENT_ID,
+      env.ORANGEAUTH_CLIENT_SECRET,
+      env.ORANGEAUTH_SCOPE,
+    ])) {
+      throw new LoginProviderConfigurationError("不能同时配置 OIDC 与 OrangeAuth");
+    }
+    const settings = oidcSettings(env);
+    return options.createProvider?.("oidc", settings)
+      ?? createOidcClient(settings, options.providerFetch);
+  }
+  if (type === "orangeauth") {
+    if (hasDefinedValue([
+      env.OIDC_DISCOVERY_URL,
+      env.OIDC_CLIENT_ID,
+      env.OIDC_CLIENT_SECRET,
+    ])) {
+      throw new LoginProviderConfigurationError("不能同时配置 OIDC 与 OrangeAuth");
+    }
+    const settings = orangeAuthSettings(env);
+    return options.createProvider?.("orangeauth", settings)
+      ?? createOrangeAuthProvider(settings, options.providerFetch);
+  }
+  throw new LoginProviderConfigurationError("OAUTH_PROVIDER_TYPE 仅支持 oidc 或 orangeauth");
 }
 
 function configuredFrontendRedirectUris(value: string | undefined): string[] {
@@ -82,7 +138,7 @@ function configuredFrontendRedirectUris(value: string | undefined): string[] {
   try {
     parsed = JSON.parse(serialized);
   } catch {
-    throw new OidcConfigurationError("OAUTH_FRONTEND_REDIRECT_URIS 不是合法 JSON");
+    throw new LoginProviderConfigurationError("OAUTH_FRONTEND_REDIRECT_URIS 不是合法 JSON");
   }
   if (
     !Array.isArray(parsed)
@@ -90,15 +146,15 @@ function configuredFrontendRedirectUris(value: string | undefined): string[] {
     || parsed.length > 32
     || !parsed.every((item) => typeof item === "string")
   ) {
-    throw new OidcConfigurationError("OAUTH_FRONTEND_REDIRECT_URIS 必须是非空字符串数组");
+    throw new LoginProviderConfigurationError("OAUTH_FRONTEND_REDIRECT_URIS 必须是非空字符串数组");
   }
   const normalized = parsed.map((item) => normalizeFrontendRedirectUri(item));
   if (normalized.some((item) => item === null)) {
-    throw new OidcConfigurationError("OAUTH_FRONTEND_REDIRECT_URIS 包含不安全 URL");
+    throw new LoginProviderConfigurationError("OAUTH_FRONTEND_REDIRECT_URIS 包含不安全 URL");
   }
   const uris = normalized as string[];
   if (new Set(uris).size !== uris.length) {
-    throw new OidcConfigurationError("OAUTH_FRONTEND_REDIRECT_URIS 包含重复 URL");
+    throw new LoginProviderConfigurationError("OAUTH_FRONTEND_REDIRECT_URIS 包含重复 URL");
   }
   return uris;
 }
@@ -139,10 +195,9 @@ function frontendFragmentRedirect(uri: string, parameters: Record<string, string
 }
 
 function dependencies(env: OAuthEnv, options: OAuthAppOptions): OAuthServiceDependencies {
-  const settings = oidcSettings(env);
   return {
     repository: createOAuthRepository(env.DB),
-    oidc: options.createOidc?.(settings) ?? createOidcClient(settings, options.oidcFetch),
+    provider: configuredProvider(env, options),
     identity: createIdentityClient(
       env.IDENTITY,
       required(env.INTERNAL_SERVICE_SECRET, "INTERNAL_SERVICE_SECRET"),
@@ -166,7 +221,7 @@ export function createOAuthApp(options: OAuthAppOptions = {}): Hono<{ Bindings: 
     if (error instanceof OAuthServiceError) {
       return c.json({ error: error.code, message: error.message }, error.status);
     }
-    if (error instanceof OidcConfigurationError || error instanceof IdentityClientError) {
+    if (error instanceof LoginProviderConfigurationError || error instanceof IdentityClientError) {
       return configurationResponse(c);
     }
     return c.json({ error: "internal_error", message: "OAuth 服务内部错误" }, 500);
@@ -214,7 +269,7 @@ export function createOAuthApp(options: OAuthAppOptions = {}): Hono<{ Bindings: 
       });
       return c.redirect(redirect.href, 303);
     } catch (error) {
-      if (error instanceof OidcConfigurationError || error instanceof IdentityClientError) {
+      if (error instanceof LoginProviderConfigurationError || error instanceof IdentityClientError) {
         return configurationResponse(c);
       }
       if (error instanceof OAuthServiceError) {

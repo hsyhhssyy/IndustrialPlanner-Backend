@@ -17,6 +17,9 @@ const DISCOVERY_URL = `${ISSUER}.well-known/openid-configuration`;
 const CLIENT_ID = "test-client";
 const CLIENT_SECRET = "test-client-secret";
 const REDIRECT_URI = "https://backend.test/v1/oauth/callback";
+const ORANGEAUTH_BASE_URL = "https://auth.yituliu.test";
+const ORANGEAUTH_CLIENT_ID = "orangeauth-test-client";
+const ORANGEAUTH_CLIENT_SECRET = "orangeauth-test-secret";
 const FRONTEND_REDIRECT_URI = "https://frontend.test/oauth/callback";
 const SECOND_FRONTEND_REDIRECT_URI = "https://preview.test/oauth/callback";
 const LOOPBACK_FRONTEND_REDIRECT_URIS = [
@@ -35,11 +38,19 @@ interface ProviderState {
   requests: string[];
 }
 
+interface OrangeProviderState {
+  expectedCodeChallenge: string;
+  requests: string[];
+  tokenRequests: number;
+  revokeRequests: number;
+}
+
 let miniflare: Miniflare;
 let env: OAuthEnv;
 let privateKey: CryptoKey;
 let publicJwk: JWK;
 let provider: ProviderState;
+let orangeProvider: OrangeProviderState;
 let accountCount = 0;
 let sessionCount = 0;
 
@@ -130,6 +141,47 @@ async function providerFetch(input: RequestInfo | URL, init?: RequestInit): Prom
   return json({ error: "not_found" }, 404);
 }
 
+async function orangeProviderFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  const request = new Request(input, init);
+  const url = new URL(request.url);
+  orangeProvider.requests.push(`${request.method} ${url.href}`);
+  if (url.pathname === "/oauth2/token" && request.method === "POST") {
+    orangeProvider.tokenRequests += 1;
+    const form = new URLSearchParams(await request.text());
+    expect(form.get("grant_type")).toBe("authorization_code");
+    expect(form.get("client_id")).toBe(ORANGEAUTH_CLIENT_ID);
+    expect(form.get("client_secret")).toBe(ORANGEAUTH_CLIENT_SECRET);
+    expect(form.get("code")).toBe("orange-provider-code");
+    expect(form.get("redirect_uri")).toBe(REDIRECT_URI);
+    expect(await codeChallenge(form.get("code_verifier") ?? "")).toBe(
+      orangeProvider.expectedCodeChallenge,
+    );
+    return json({
+      code: 200,
+      data: {
+        access_token: "orange-access-token-not-persisted",
+        refresh_token: "orange-refresh-token-not-persisted",
+        expires_in: 7200,
+      },
+    });
+  }
+  if (url.pathname === "/oauth2/userinfo" && request.method === "GET") {
+    expect(request.headers.get("authorization")).toBe(
+      "Bearer orange-access-token-not-persisted",
+    );
+    return json({ code: 200, data: { uid: "orange-user-1", userName: "planner-user" } });
+  }
+  if (url.pathname === "/oauth2/revoke" && request.method === "POST") {
+    orangeProvider.revokeRequests += 1;
+    const form = new URLSearchParams(await request.text());
+    expect(form.get("client_id")).toBe(ORANGEAUTH_CLIENT_ID);
+    expect(form.get("client_secret")).toBe(ORANGEAUTH_CLIENT_SECRET);
+    expect(form.get("token")).toBe("orange-refresh-token-not-persisted");
+    return json({ code: 200 });
+  }
+  return json({ code: 404 }, 404);
+}
+
 const identityBinding: IdentityBinding = {
   async fetch(input, init) {
     const request = new Request(input, init);
@@ -153,7 +205,7 @@ const identityBinding: IdentityBinding = {
 };
 
 async function request(pathname: string, init?: RequestInit): Promise<Response> {
-  const app = createOAuthApp({ oidcFetch: providerFetch });
+  const app = createOAuthApp({ providerFetch });
   return await app.fetch(new Request(`https://backend.test${pathname}`, init), env);
 }
 
@@ -185,6 +237,46 @@ async function authorize(
 
 async function callback(state: string): Promise<Response> {
   return request(`/v1/oauth/callback?code=provider-code&state=${encodeURIComponent(state)}`);
+}
+
+function orangeEnv(): OAuthEnv {
+  return {
+    ...env,
+    OAUTH_PROVIDER_TYPE: "orangeauth",
+    OIDC_DISCOVERY_URL: undefined,
+    OIDC_CLIENT_ID: undefined,
+    OIDC_CLIENT_SECRET: undefined,
+    ORANGEAUTH_BASE_URL,
+    ORANGEAUTH_CLIENT_ID,
+    ORANGEAUTH_CLIENT_SECRET,
+    ORANGEAUTH_SCOPE: "user.read",
+  };
+}
+
+async function orangeRequest(pathname: string, init?: RequestInit): Promise<Response> {
+  const app = createOAuthApp({ providerFetch: orangeProviderFetch });
+  return app.fetch(new Request(`https://backend.test${pathname}`, init), orangeEnv());
+}
+
+async function orangeAuthorize(): Promise<string> {
+  const parameters = new URLSearchParams({
+    frontend_redirect_uri: FRONTEND_REDIRECT_URI,
+    oauth_channel: OAUTH_CHANNEL,
+  });
+  const response = await orangeRequest(`/v1/oauth/authorize?${parameters.toString()}`);
+  expect(response.status, await response.clone().text()).toBe(302);
+  const url = new URL(response.headers.get("location") ?? "");
+  expect(url.href.startsWith(`${ORANGEAUTH_BASE_URL}/oauth2/authorize?`)).toBe(true);
+  expect(url.searchParams.get("scope")).toBe("user.read");
+  expect(url.searchParams.get("redirect_uri")).toBe(REDIRECT_URI);
+  orangeProvider.expectedCodeChallenge = url.searchParams.get("code_challenge") ?? "";
+  return url.searchParams.get("state") ?? "";
+}
+
+async function orangeCallback(state: string): Promise<Response> {
+  return orangeRequest(
+    `/v1/oauth/callback?code=orange-provider-code&state=${encodeURIComponent(state)}`,
+  );
 }
 
 function callbackParameters(response: Response): URLSearchParams {
@@ -222,10 +314,11 @@ beforeAll(async () => {
     DB: db,
     IDENTITY: identityBinding,
     OAUTH_ENABLED: "true",
+    OAUTH_PROVIDER_TYPE: "oidc",
     OIDC_DISCOVERY_URL: DISCOVERY_URL,
     OIDC_CLIENT_ID: CLIENT_ID,
     OIDC_CLIENT_SECRET: CLIENT_SECRET,
-    OIDC_REDIRECT_URI: REDIRECT_URI,
+    OAUTH_REDIRECT_URI: REDIRECT_URI,
     OAUTH_FRONTEND_REDIRECT_URIS: JSON.stringify([
       FRONTEND_REDIRECT_URI,
       SECOND_FRONTEND_REDIRECT_URI,
@@ -245,15 +338,21 @@ beforeEach(() => {
     tokenRequests: 0,
     requests: [],
   };
+  orangeProvider = {
+    expectedCodeChallenge: "",
+    requests: [],
+    tokenRequests: 0,
+    revokeRequests: 0,
+  };
 });
 
 afterAll(async () => {
   await miniflare.dispose();
 });
 
-describe("OIDC 登录闭环", () => {
+describe("身份 Provider 登录闭环", () => {
   it("显式禁用时所有 OAuth 动态端点 fail-closed 且不访问 Provider", async () => {
-    const app = createOAuthApp({ oidcFetch: providerFetch });
+    const app = createOAuthApp({ providerFetch });
     const disabledEnv: OAuthEnv = {
       DB: env.DB,
       IDENTITY: identityBinding,
@@ -290,7 +389,7 @@ describe("OIDC 登录闭环", () => {
   });
 
   it("OAuth 开关缺失或非法时返回配置错误", async () => {
-    const app = createOAuthApp({ oidcFetch: providerFetch });
+    const app = createOAuthApp({ providerFetch });
     for (const value of [undefined, "TRUE", "1"]) {
       const response = await app.fetch(
         new Request("https://backend.test/v1/oauth/authorize"),
@@ -451,6 +550,31 @@ describe("OIDC 登录闭环", () => {
     expect(await replay.json()).toMatchObject({ error: "oauth_state_invalid" });
   });
 
+  it("合法 state 的 access_denied 原子消费事务并返回 Provider 无关错误", async () => {
+    const { state } = await authorize();
+    const tokenRequestsBefore = provider.tokenRequests;
+    const response = await request(
+      `/v1/oauth/callback?error=access_denied&state=${encodeURIComponent(state)}`,
+    );
+    expect(callbackParameters(response).get("error")).toBe("oauth_access_denied");
+    expect(provider.tokenRequests).toBe(tokenRequestsBefore);
+    const replay = await callback(state);
+    expect(replay.status).toBe(400);
+    expect(await replay.json()).toMatchObject({ error: "oauth_state_invalid" });
+  });
+
+  it("配置切换后拒绝由新适配器解释旧登录事务", async () => {
+    const { state } = await authorize();
+    const response = await orangeRequest(
+      `/v1/oauth/callback?code=orange-provider-code&state=${encodeURIComponent(state)}`,
+    );
+    expect(callbackParameters(response).get("error")).toBe("oauth_callback_invalid");
+    expect(orangeProvider.requests).toEqual([]);
+    const replay = await callback(state);
+    expect(replay.status).toBe(400);
+    expect(await replay.json()).toMatchObject({ error: "oauth_state_invalid" });
+  });
+
   it("nonce 不匹配时拒绝创建映射", async () => {
     const accountsBefore = accountCount;
     const { state } = await authorize();
@@ -481,6 +605,92 @@ describe("OIDC 登录闭环", () => {
     expect(responses.map((response) => response.status).sort()).toEqual([200, 400]);
   });
 
+  it("OrangeAuth 首次/重复登录复用独立账户且不持久化 Provider token", async () => {
+    const accountsBefore = accountCount;
+    const firstState = await orangeAuthorize();
+    const firstCallback = await orangeCallback(firstState);
+    const firstLocation = firstCallback.headers.get("location") ?? "";
+    expect(firstLocation).not.toContain("orange-access-token-not-persisted");
+    expect(firstLocation).not.toContain("orange-refresh-token-not-persisted");
+    const firstCode = callbackCode(firstCallback);
+    const firstSession = await orangeRequest("/v1/oauth/session", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ code: firstCode }),
+    });
+    expect(firstSession.status, await firstSession.clone().text()).toBe(200);
+    const firstBody = await firstSession.json() as {
+      accessToken: string;
+      account: { accountId: string; username: string };
+    };
+    expect(firstBody.account.username).toBe("planner-user");
+    expect(JSON.stringify(firstBody)).not.toContain("orange-access-token-not-persisted");
+    expect(JSON.stringify(firstBody)).not.toContain("orange-refresh-token-not-persisted");
+    expect(accountCount).toBe(accountsBefore + 1);
+
+    const secondState = await orangeAuthorize();
+    const secondCode = callbackCode(await orangeCallback(secondState));
+    const secondSession = await orangeRequest("/v1/oauth/session", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ code: secondCode }),
+    });
+    expect(secondSession.status, await secondSession.clone().text()).toBe(200);
+    const secondBody = await secondSession.json() as {
+      account: { accountId: string; username: string };
+    };
+    expect(secondBody.account.accountId).toBe(firstBody.account.accountId);
+    expect(accountCount).toBe(accountsBefore + 1);
+    expect(orangeProvider.tokenRequests).toBe(2);
+    expect(orangeProvider.revokeRequests).toBe(2);
+
+    const mappings = await env.DB.prepare(
+      `SELECT provider_key, subject, account_id FROM oauth_mappings
+       WHERE subject IN ('provider-user-1', 'orange-user-1') ORDER BY provider_key`,
+    ).all<{ provider_key: string; subject: string; account_id: string }>();
+    expect(mappings.results).toHaveLength(2);
+    expect(new Set(mappings.results.map((mapping) => mapping.account_id)).size).toBe(2);
+    expect(mappings.results.map((mapping) => mapping.provider_key)).toContain(
+      "orangeauth:https://auth.yituliu.test",
+    );
+
+    for (const table of [
+      "oauth_mappings",
+      "oauth_login_transactions",
+      "oauth_callback_codes",
+    ]) {
+      const rows = await env.DB.prepare(`SELECT * FROM ${table}`).all();
+      const persisted = JSON.stringify(rows.results);
+      expect(persisted).not.toContain("orange-access-token-not-persisted");
+      expect(persisted).not.toContain("orange-refresh-token-not-persisted");
+    }
+  });
+
+  it("Provider 判别式配置缺失、未知或同时配置两个适配器时 fail-closed", async () => {
+    const parameters = new URLSearchParams({
+      frontend_redirect_uri: FRONTEND_REDIRECT_URI,
+      oauth_channel: OAUTH_CHANNEL,
+    });
+    const app = createOAuthApp({ providerFetch });
+    const invalidEnvironments: OAuthEnv[] = [
+      { ...env, OAUTH_PROVIDER_TYPE: undefined },
+      { ...env, OAUTH_PROVIDER_TYPE: "unknown" },
+      { ...env, ORANGEAUTH_BASE_URL },
+      { ...orangeEnv(), OIDC_CLIENT_ID: CLIENT_ID },
+    ];
+    for (const invalidEnv of invalidEnvironments) {
+      const response = await app.fetch(
+        new Request(`https://backend.test/v1/oauth/authorize?${parameters.toString()}`),
+        invalidEnv,
+      );
+      expect(response.status).toBe(500);
+      expect(await response.json()).toEqual({
+        error: "configuration_error",
+        message: "OAuth 服务配置无效",
+      });
+    }
+  });
+
   it("缺失配置时 fail-closed 且不泄露字段值", async () => {
     const saved = env.OIDC_CLIENT_SECRET;
     env.OIDC_CLIENT_SECRET = undefined;
@@ -491,5 +701,79 @@ describe("OIDC 登录闭环", () => {
       error: "configuration_error",
       message: "OAuth 服务配置无效",
     });
+  });
+
+  it("0004 migration 原位保留既有 OIDC 映射、account_id 与 nonce 上下文", async () => {
+    const migrationMiniflare = new Miniflare({
+      modules: true,
+      script: "export default { fetch() { return new Response('ok') } }",
+      compatibilityDate: "2025-08-06",
+      d1Databases: ["DB"],
+    });
+    try {
+      const db = await migrationMiniflare.getD1Database("DB") as unknown as D1Database;
+      const migrationsDirectory = path.resolve(__dirname, "..", "migrations");
+      for (const filename of [
+        "0001_create_oidc_login.sql",
+        "0002_add_callback_username.sql",
+        "0003_add_frontend_callback.sql",
+      ]) {
+        const sql = fs.readFileSync(path.join(migrationsDirectory, filename), "utf8");
+        for (const statement of sql.split(";").map((value) => value.trim()).filter(Boolean)) {
+          await db.prepare(statement).run();
+        }
+      }
+      await db.prepare(
+        `INSERT INTO oauth_mappings(issuer, subject, account_id, created_at)
+         VALUES (?1, ?2, ?3, ?4)`,
+      ).bind(ISSUER, "legacy-subject", "legacy-account", "2026-08-29T00:00:00.000Z").run();
+      await db.prepare(
+        `INSERT INTO oauth_login_transactions(
+           state_hash, state_value, code_verifier, nonce, frontend_redirect_uri,
+           oauth_channel, expires_at, consumed_at, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8)`,
+      ).bind(
+        "legacy-state-hash",
+        "legacy-state",
+        "legacy-verifier",
+        "legacy-nonce",
+        FRONTEND_REDIRECT_URI,
+        OAUTH_CHANNEL,
+        "2099-01-01T00:00:00.000Z",
+        "2026-08-29T00:00:00.000Z",
+      ).run();
+
+      const migration = fs.readFileSync(
+        path.join(migrationsDirectory, "0004_generalize_login_provider.sql"),
+        "utf8",
+      );
+      for (const statement of migration.split(";").map((value) => value.trim()).filter(Boolean)) {
+        await db.prepare(statement).run();
+      }
+
+      const mapping = await db.prepare(
+        `SELECT provider_key, subject, account_id FROM oauth_mappings
+         WHERE provider_key=?1 AND subject=?2`,
+      ).bind(ISSUER, "legacy-subject").first<{
+        provider_key: string;
+        subject: string;
+        account_id: string;
+      }>();
+      expect(mapping).toEqual({
+        provider_key: ISSUER,
+        subject: "legacy-subject",
+        account_id: "legacy-account",
+      });
+      const transaction = await db.prepare(
+        `SELECT provider_type, provider_context FROM oauth_login_transactions
+         WHERE state_hash='legacy-state-hash'`,
+      ).first<{ provider_type: string; provider_context: string }>();
+      expect(transaction).toEqual({
+        provider_type: "oidc",
+        provider_context: "legacy-nonce",
+      });
+    } finally {
+      await migrationMiniflare.dispose();
+    }
   });
 });

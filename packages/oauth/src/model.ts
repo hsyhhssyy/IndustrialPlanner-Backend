@@ -1,10 +1,12 @@
 import type { AccountId } from "@industrial/shared";
+import type { LoginProviderType } from "./provider";
 
 export interface OAuthLoginTransaction {
   stateHash: string;
   stateValue: string;
   codeVerifier: string;
-  nonce: string;
+  providerType: LoginProviderType;
+  providerContext: string;
   frontendRedirectUri: string;
   oauthChannel: string;
   expiresAt: string;
@@ -43,7 +45,7 @@ export function isValidOAuthChannel(value: string): boolean {
 }
 
 export interface OAuthMapping {
-  issuer: string;
+  providerKey: string;
   subject: string;
   accountId: AccountId;
   createdAt: string;

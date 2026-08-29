@@ -15,10 +15,16 @@
       "enableOAuth": false
     },
     "oauth": {
-      "_comment": "OIDC Provider callback 与允许的前端完成页，均作为 vars 注入 oauth-worker",
-      "discoveryUrl": "<stable-oidc-discovery-url>",
-      "clientId": "<stable-oidc-client-id>",
-      "redirectUri": "<stable-oidc-redirect-uri>",
+      "_comment": "OAuth 当前关闭；以下 OrangeAuth 配置只展示未来启用形态，不会在关闭时注入 Worker",
+      "provider": {
+        "type": "orangeauth",
+        "orangeauth": {
+          "baseUrl": "https://auth.yituliu.cn",
+          "clientId": "<stable-orangeauth-client-id>",
+          "scope": "user.read"
+        }
+      },
+      "redirectUri": "<stable-oauth-redirect-uri>",
       "frontendRedirectUris": [
         "<stable-frontend-oauth-landing-uri>"
       ]
@@ -44,7 +50,7 @@
         "INTERNAL_SERVICE_SECRET": "<secret>"
       },
       "oauth": {
-        "OIDC_CLIENT_SECRET": "<secret>",
+        "ORANGEAUTH_CLIENT_SECRET": "<secret>",
         "INTERNAL_SERVICE_SECRET": "<secret>"
       }
     },
@@ -61,10 +67,15 @@
       "enableOAuth": true
     },
     "oauth": {
-      "_comment": "OIDC Provider callback 与允许的前端完成页，均作为 vars 注入 oauth-worker",
-      "discoveryUrl": "<beta-oidc-discovery-url>",
-      "clientId": "<beta-oidc-client-id>",
-      "redirectUri": "<beta-oidc-redirect-uri>",
+      "_comment": "当前选择标准 OIDC；同一环境不得再提供 orangeauth 配置块",
+      "provider": {
+        "type": "oidc",
+        "oidc": {
+          "discoveryUrl": "<beta-oidc-discovery-url>",
+          "clientId": "<beta-oidc-client-id>"
+        }
+      },
+      "redirectUri": "<beta-oauth-redirect-uri>",
       "frontendRedirectUris": [
         "<beta-dev-frontend-oauth-landing-uri>",
         "<beta-pre-frontend-oauth-landing-uri>",

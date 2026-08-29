@@ -14,6 +14,9 @@ const DISCOVERY_URL = `${ISSUER}.well-known/openid-configuration`;
 const CLIENT_ID = "multiworker-client";
 const CLIENT_SECRET = "multiworker-client-secret";
 const REDIRECT_URI = "https://gateway.test/v1/oauth/callback";
+const ORANGEAUTH_BASE_URL = "https://auth.yituliu.test";
+const ORANGEAUTH_CLIENT_ID = "multiworker-orangeauth-client";
+const ORANGEAUTH_CLIENT_SECRET = "multiworker-orangeauth-secret";
 const FRONTEND_REDIRECT_URI = "https://frontend.test/oauth/callback";
 const OAUTH_CHANNEL = "multiworker-oauth-channel-0123456789";
 
@@ -22,11 +25,13 @@ interface ProviderState {
   codeChallenge: string;
   requests: string[];
   tokenForm: Record<string, string>;
+  revokeForm: Record<string, string>;
 }
 
 interface Harness {
   miniflare: Miniflare;
   provider: ProviderState;
+  providerType: "oidc" | "orangeauth";
 }
 
 let bundles: Record<string, string>;
@@ -107,7 +112,7 @@ async function pkceChallenge(verifier: string): Promise<string> {
   return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/u, "");
 }
 
-function providerHandler(provider: ProviderState) {
+function providerHandler(provider: ProviderState, providerType: "oidc" | "orangeauth") {
   return async (request: Request): Promise<Response> => {
     const url = new URL(request.url);
     provider.requests.push(`${request.method} ${url.href}`);
@@ -154,6 +159,53 @@ function providerHandler(provider: ProviderState) {
         id_token: idToken,
       });
     }
+    if (
+      providerType === "orangeauth"
+      && url.href === `${ORANGEAUTH_BASE_URL}/oauth2/token`
+      && request.method === "POST"
+    ) {
+      const form = new URLSearchParams(await request.text());
+      provider.tokenForm = Object.fromEntries(form.entries());
+      expect(form.get("grant_type")).toBe("authorization_code");
+      expect(form.get("code")).toBe("orange-provider-code");
+      expect(form.get("redirect_uri")).toBe(REDIRECT_URI);
+      expect(form.get("client_id")).toBe(ORANGEAUTH_CLIENT_ID);
+      expect(form.get("client_secret")).toBe(ORANGEAUTH_CLIENT_SECRET);
+      expect(await pkceChallenge(form.get("code_verifier") ?? "")).toBe(provider.codeChallenge);
+      return json({
+        code: 200,
+        data: {
+          access_token: "multiworker-orange-access-token",
+          refresh_token: "multiworker-orange-refresh-token",
+          expires_in: 7200,
+        },
+      });
+    }
+    if (
+      providerType === "orangeauth"
+      && url.href === `${ORANGEAUTH_BASE_URL}/oauth2/userinfo`
+      && request.method === "GET"
+    ) {
+      expect(request.headers.get("authorization")).toBe(
+        "Bearer multiworker-orange-access-token",
+      );
+      return json({
+        code: 200,
+        data: { uid: "multiworker-orange-user", userName: "multiworker-user" },
+      });
+    }
+    if (
+      providerType === "orangeauth"
+      && url.href === `${ORANGEAUTH_BASE_URL}/oauth2/revoke`
+      && request.method === "POST"
+    ) {
+      const form = new URLSearchParams(await request.text());
+      provider.revokeForm = Object.fromEntries(form.entries());
+      expect(form.get("client_id")).toBe(ORANGEAUTH_CLIENT_ID);
+      expect(form.get("client_secret")).toBe(ORANGEAUTH_CLIENT_SECRET);
+      expect(form.get("token")).toBe("multiworker-orange-refresh-token");
+      return json({ code: 200 });
+    }
     return json({ error: "not_found" }, 404);
   };
 }
@@ -161,8 +213,15 @@ function providerHandler(provider: ProviderState) {
 async function createHarness(
   allowAnonymousSpaces: boolean,
   oauthEnabled = true,
+  providerType: "oidc" | "orangeauth" = "oidc",
 ): Promise<Harness> {
-  const provider: ProviderState = { nonce: "", codeChallenge: "", requests: [], tokenForm: {} };
+  const provider: ProviderState = {
+    nonce: "",
+    codeChallenge: "",
+    requests: [],
+    tokenForm: {},
+    revokeForm: {},
+  };
   const allow = String(allowAnonymousSpaces);
   const workers: NonNullable<Extract<MiniflareOptions, { workers: unknown }> ["workers"]> = [
     {
@@ -186,14 +245,22 @@ async function createHarness(
       script: bundles.oauth!,
       d1Databases: { DB: "oauth-e2e-db" },
       serviceBindings: { IDENTITY: "identity" },
-      outboundService: providerHandler(provider),
+      outboundService: providerHandler(provider, providerType),
       bindings: {
         OAUTH_ENABLED: String(oauthEnabled),
         ...(oauthEnabled ? {
-          OIDC_DISCOVERY_URL: DISCOVERY_URL,
-          OIDC_CLIENT_ID: CLIENT_ID,
-          OIDC_CLIENT_SECRET: CLIENT_SECRET,
-          OIDC_REDIRECT_URI: REDIRECT_URI,
+          OAUTH_PROVIDER_TYPE: providerType,
+          ...(providerType === "oidc" ? {
+            OIDC_DISCOVERY_URL: DISCOVERY_URL,
+            OIDC_CLIENT_ID: CLIENT_ID,
+            OIDC_CLIENT_SECRET: CLIENT_SECRET,
+          } : {
+            ORANGEAUTH_BASE_URL,
+            ORANGEAUTH_CLIENT_ID,
+            ORANGEAUTH_CLIENT_SECRET,
+            ORANGEAUTH_SCOPE: "user.read",
+          }),
+          OAUTH_REDIRECT_URI: REDIRECT_URI,
           OAUTH_FRONTEND_REDIRECT_URIS: JSON.stringify([FRONTEND_REDIRECT_URI]),
         } : {}),
         INTERNAL_SERVICE_SECRET: INTERNAL_SECRET,
@@ -241,7 +308,7 @@ async function createHarness(
     await miniflare.getD1Database("DB", "sync") as unknown as D1Database,
     "sync",
   );
-  return { miniflare, provider };
+  return { miniflare, provider, providerType };
 }
 
 async function authorize(harness: Harness): Promise<string> {
@@ -255,7 +322,9 @@ async function authorize(harness: Harness): Promise<string> {
   expect(response.status, await response.clone().text()).toBe(302);
   const redirect = new URL(response.headers.get("location") ?? "");
   expect(redirect.searchParams.get("redirect_uri")).toBe(REDIRECT_URI);
-  expect(redirect.searchParams.get("scope")).toBe("openid profile");
+  expect(redirect.searchParams.get("scope")).toBe(
+    harness.providerType === "oidc" ? "openid profile" : "user.read",
+  );
   harness.provider.nonce = redirect.searchParams.get("nonce") ?? "";
   harness.provider.codeChallenge = redirect.searchParams.get("code_challenge") ?? "";
   return redirect.searchParams.get("state") ?? "";
@@ -264,7 +333,9 @@ async function authorize(harness: Harness): Promise<string> {
 async function login(harness: Harness): Promise<string> {
   const state = await authorize(harness);
   const callback = await harness.miniflare.dispatchFetch(
-    `https://gateway.test/v1/oauth/callback?code=provider-code&state=${encodeURIComponent(state)}`,
+    `https://gateway.test/v1/oauth/callback?code=${
+      harness.providerType === "oidc" ? "provider-code" : "orange-provider-code"
+    }&state=${encodeURIComponent(state)}`,
     { redirect: "manual" },
   );
   expect(callback.status, await callback.clone().text()).toBe(303);
@@ -319,7 +390,7 @@ afterAll(async () => {
   await Promise.all(activeHarnesses.map((miniflare) => miniflare.dispose()));
 });
 
-describe("Miniflare 多 Worker OIDC 与同步端到端", () => {
+describe("Miniflare 多 Worker 身份 Provider 与同步端到端", () => {
   it("beta 首次/重复 OIDC 登录复用账户与账户空间", async () => {
     const harness = await createHarness(true);
     const firstToken = await login(harness);
@@ -327,6 +398,20 @@ describe("Miniflare 多 Worker OIDC 与同步端到端", () => {
     const secondToken = await login(harness);
     const secondSpace = await mine(harness, secondToken);
     expect(secondSpace.spaceId).toBe(firstSpace.spaceId);
+  }, 15_000);
+
+  it("beta OrangeAuth 首次/重复登录复用账户与账户空间", async () => {
+    const harness = await createHarness(true, true, "orangeauth");
+    const firstToken = await login(harness);
+    const firstSpace = await mine(harness, firstToken);
+    const secondToken = await login(harness);
+    const secondSpace = await mine(harness, secondToken);
+    expect(secondSpace.spaceId).toBe(firstSpace.spaceId);
+    expect(harness.provider.revokeForm).toEqual({
+      client_id: ORANGEAUTH_CLIENT_ID,
+      client_secret: ORANGEAUTH_CLIENT_SECRET,
+      token: "multiworker-orange-refresh-token",
+    });
   }, 15_000);
 
   it("stable 可禁用 OAuth，保持 telemetry/capabilities 匿名但拒绝匿名数据路径", async () => {

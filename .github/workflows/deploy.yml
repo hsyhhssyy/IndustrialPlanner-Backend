@@ -142,9 +142,9 @@ jobs:
               and ($target.d1.identityDatabaseId | uuid)
               and ($target.d1.oauthDatabaseId | uuid)
               and (if $target.flags.enableOAuth then
-                ($oauth_secret.OIDC_CLIENT_SECRET | configured)
-                and ($oauth.discoveryUrl | configured and startswith("https://") and endswith("/.well-known/openid-configuration"))
-                and ($oauth.clientId | configured)
+                ($oauth | type == "object")
+                and ($oauth.provider | type == "object")
+                and ($oauth.provider.type == "oidc" or $oauth.provider.type == "orangeauth")
                 and ($oauth.redirectUri | configured and startswith("https://"))
                 and ($oauth.frontendRedirectUris | type == "array" and length > 0 and length <= 32)
                 and ($oauth.frontendRedirectUris | all(.[];
@@ -157,6 +157,22 @@ jobs:
                   and (contains("#") | not)
                 ))
                 and (($oauth.frontendRedirectUris | unique | length) == ($oauth.frontendRedirectUris | length))
+                and (if $oauth.provider.type == "oidc" then
+                  ($oauth.provider.oidc | type == "object")
+                  and (($oauth.provider | has("orangeauth")) | not)
+                  and ($oauth.provider.oidc.discoveryUrl | configured and startswith("https://") and endswith("/.well-known/openid-configuration"))
+                  and ($oauth.provider.oidc.clientId | configured)
+                  and ($oauth_secret.OIDC_CLIENT_SECRET | configured)
+                  and (($oauth_secret | has("ORANGEAUTH_CLIENT_SECRET")) | not)
+                else
+                  ($oauth.provider.orangeauth | type == "object")
+                  and (($oauth.provider | has("oidc")) | not)
+                  and ($oauth.provider.orangeauth.baseUrl | configured and startswith("https://"))
+                  and ($oauth.provider.orangeauth.clientId | configured)
+                  and ($oauth.provider.orangeauth.scope == "user.read")
+                  and ($oauth_secret.ORANGEAUTH_CLIENT_SECRET | configured)
+                  and (($oauth_secret | has("OIDC_CLIENT_SECRET")) | not)
+                end)
               else true end)
           ' "$config_file" >/dev/null; then
             echo "Missing, placeholder, inconsistent, or invalid deploy config for $CF_ENVIRONMENT" >&2
@@ -171,6 +187,43 @@ jobs:
             const target = JSON.parse(fs.readFileSync(configFile, "utf8"))[environment];
             if (target.flags.enableOAuth === false) process.exit(0);
             if (target.flags.enableOAuth !== true) throw new Error("invalid OAuth flag");
+            const redirectUri = new URL(target.oauth.redirectUri);
+            if (
+              redirectUri.protocol !== "https:"
+              || redirectUri.username
+              || redirectUri.password
+              || redirectUri.search
+              || redirectUri.hash
+            ) {
+              throw new Error("unsafe OAuth redirect URL");
+            }
+            if (target.oauth.provider.type === "orangeauth") {
+              const baseUrl = new URL(target.oauth.provider.orangeauth.baseUrl);
+              if (
+                baseUrl.protocol !== "https:"
+                || baseUrl.username
+                || baseUrl.password
+                || baseUrl.search
+                || baseUrl.hash
+                || baseUrl.pathname !== "/"
+              ) {
+                throw new Error("unsafe OrangeAuth root URL");
+              }
+            } else if (target.oauth.provider.type === "oidc") {
+              const discoveryUrl = new URL(target.oauth.provider.oidc.discoveryUrl);
+              if (
+                discoveryUrl.protocol !== "https:"
+                || discoveryUrl.username
+                || discoveryUrl.password
+                || discoveryUrl.search
+                || discoveryUrl.hash
+                || !discoveryUrl.pathname.endsWith("/.well-known/openid-configuration")
+              ) {
+                throw new Error("unsafe OIDC discovery URL");
+              }
+            } else {
+              throw new Error("unknown OAuth provider type");
+            }
             const values = target.oauth.frontendRedirectUris;
             const loopbackHostnames = new Set(["localhost", "127.0.0.1", "[::1]"]);
             const normalized = values.map((value) => {
@@ -210,9 +263,18 @@ jobs:
           echo "DEPLOY_CONFIG_FILE=$config_file" >> "$GITHUB_ENV"
           echo "ALLOW_ANONYMOUS_SPACES=$(jq -r --arg environment "$CF_ENVIRONMENT" '.[$environment].flags.allowAnonymousSpaces' "$config_file")" >> "$GITHUB_ENV"
           echo "OAUTH_ENABLED=$(jq -r --arg environment "$CF_ENVIRONMENT" '.[$environment].flags.enableOAuth' "$config_file")" >> "$GITHUB_ENV"
-          echo "OIDC_DISCOVERY_URL=$(jq -r --arg environment "$CF_ENVIRONMENT" '.[$environment].oauth.discoveryUrl' "$config_file")" >> "$GITHUB_ENV"
-          echo "OIDC_CLIENT_ID=$(jq -r --arg environment "$CF_ENVIRONMENT" '.[$environment].oauth.clientId' "$config_file")" >> "$GITHUB_ENV"
-          echo "OIDC_REDIRECT_URI=$(jq -r --arg environment "$CF_ENVIRONMENT" '.[$environment].oauth.redirectUri' "$config_file")" >> "$GITHUB_ENV"
+          if [ "$(jq -r --arg environment "$CF_ENVIRONMENT" '.[$environment].flags.enableOAuth' "$config_file")" = 'true' ]; then
+            echo "OAUTH_PROVIDER_TYPE=$(jq -r --arg environment "$CF_ENVIRONMENT" '.[$environment].oauth.provider.type' "$config_file")" >> "$GITHUB_ENV"
+            echo "OAUTH_REDIRECT_URI=$(jq -r --arg environment "$CF_ENVIRONMENT" '.[$environment].oauth.redirectUri' "$config_file")" >> "$GITHUB_ENV"
+            if [ "$(jq -r --arg environment "$CF_ENVIRONMENT" '.[$environment].oauth.provider.type' "$config_file")" = 'oidc' ]; then
+              echo "OIDC_DISCOVERY_URL=$(jq -r --arg environment "$CF_ENVIRONMENT" '.[$environment].oauth.provider.oidc.discoveryUrl' "$config_file")" >> "$GITHUB_ENV"
+              echo "OIDC_CLIENT_ID=$(jq -r --arg environment "$CF_ENVIRONMENT" '.[$environment].oauth.provider.oidc.clientId' "$config_file")" >> "$GITHUB_ENV"
+            else
+              echo "ORANGEAUTH_BASE_URL=$(jq -r --arg environment "$CF_ENVIRONMENT" '.[$environment].oauth.provider.orangeauth.baseUrl' "$config_file")" >> "$GITHUB_ENV"
+              echo "ORANGEAUTH_CLIENT_ID=$(jq -r --arg environment "$CF_ENVIRONMENT" '.[$environment].oauth.provider.orangeauth.clientId' "$config_file")" >> "$GITHUB_ENV"
+              echo "ORANGEAUTH_SCOPE=$(jq -r --arg environment "$CF_ENVIRONMENT" '.[$environment].oauth.provider.orangeauth.scope' "$config_file")" >> "$GITHUB_ENV"
+            fi
+          fi
           # AI-REMOVED 2026-08-24:
           # Reason: 单一前端地址无法表达 dev、pre、beta 共用 Beta 后端的精确 allowlist。
           # Trigger: 用户明确要求前端携带完整 URL，且不保留 Beta 旧协议兼容。
@@ -223,7 +285,9 @@ jobs:
           #
           # Original code:
           # echo "OAUTH_FRONTEND_REDIRECT_URI=$(jq -r --arg environment "$CF_ENVIRONMENT" '.[$environment].oauth.frontendRedirectUri // .[$environment].oauth.redirectUri' "$config_file")" >> "$GITHUB_ENV"
-          echo "OAUTH_FRONTEND_REDIRECT_URIS=$(jq -c --arg environment "$CF_ENVIRONMENT" '.[$environment].oauth.frontendRedirectUris' "$config_file")" >> "$GITHUB_ENV"
+          if [ "$(jq -r --arg environment "$CF_ENVIRONMENT" '.[$environment].flags.enableOAuth' "$config_file")" = 'true' ]; then
+            echo "OAUTH_FRONTEND_REDIRECT_URIS=$(jq -c --arg environment "$CF_ENVIRONMENT" '.[$environment].oauth.frontendRedirectUris' "$config_file")" >> "$GITHUB_ENV"
+          fi
           echo "IDENTITY_D1_ID=$(jq -r --arg environment "$CF_ENVIRONMENT" '.[$environment].d1.identityDatabaseId' "$config_file")" >> "$GITHUB_ENV"
           echo "OAUTH_D1_ID=$(jq -r --arg environment "$CF_ENVIRONMENT" '.[$environment].d1.oauthDatabaseId' "$config_file")" >> "$GITHUB_ENV"
 
@@ -283,13 +347,26 @@ jobs:
             # Human Review: Required
             # Original code: --var "OAUTH_FRONTEND_REDIRECT_URI:$OAUTH_FRONTEND_REDIRECT_URI"
             if [ "$OAUTH_ENABLED" = 'true' ]; then
-              pnpm --filter @industrial/oauth exec -- npx wrangler deploy --env beta \
-                --secrets-file "$RUNNER_TEMP/oauth-secrets.json" \
-                --var "OAUTH_ENABLED:true" \
-                --var "OIDC_DISCOVERY_URL:$OIDC_DISCOVERY_URL" \
-                --var "OIDC_CLIENT_ID:$OIDC_CLIENT_ID" \
-                --var "OIDC_REDIRECT_URI:$OIDC_REDIRECT_URI" \
-                --var "OAUTH_FRONTEND_REDIRECT_URIS:$OAUTH_FRONTEND_REDIRECT_URIS"
+              if [ "$OAUTH_PROVIDER_TYPE" = 'oidc' ]; then
+                pnpm --filter @industrial/oauth exec -- npx wrangler deploy --env beta \
+                  --secrets-file "$RUNNER_TEMP/oauth-secrets.json" \
+                  --var "OAUTH_ENABLED:true" \
+                  --var "OAUTH_PROVIDER_TYPE:oidc" \
+                  --var "OIDC_DISCOVERY_URL:$OIDC_DISCOVERY_URL" \
+                  --var "OIDC_CLIENT_ID:$OIDC_CLIENT_ID" \
+                  --var "OAUTH_REDIRECT_URI:$OAUTH_REDIRECT_URI" \
+                  --var "OAUTH_FRONTEND_REDIRECT_URIS:$OAUTH_FRONTEND_REDIRECT_URIS"
+              else
+                pnpm --filter @industrial/oauth exec -- npx wrangler deploy --env beta \
+                  --secrets-file "$RUNNER_TEMP/oauth-secrets.json" \
+                  --var "OAUTH_ENABLED:true" \
+                  --var "OAUTH_PROVIDER_TYPE:orangeauth" \
+                  --var "ORANGEAUTH_BASE_URL:$ORANGEAUTH_BASE_URL" \
+                  --var "ORANGEAUTH_CLIENT_ID:$ORANGEAUTH_CLIENT_ID" \
+                  --var "ORANGEAUTH_SCOPE:$ORANGEAUTH_SCOPE" \
+                  --var "OAUTH_REDIRECT_URI:$OAUTH_REDIRECT_URI" \
+                  --var "OAUTH_FRONTEND_REDIRECT_URIS:$OAUTH_FRONTEND_REDIRECT_URIS"
+              fi
             else
               pnpm --filter @industrial/oauth exec -- npx wrangler deploy --env beta \
                 --secrets-file "$RUNNER_TEMP/oauth-secrets.json" \
@@ -327,13 +404,26 @@ jobs:
             # Human Review: Required
             # Original code: --var "OAUTH_FRONTEND_REDIRECT_URI:$OAUTH_FRONTEND_REDIRECT_URI"
             if [ "$OAUTH_ENABLED" = 'true' ]; then
-              pnpm --filter @industrial/oauth exec -- npx wrangler deploy \
-                --secrets-file "$RUNNER_TEMP/oauth-secrets.json" \
-                --var "OAUTH_ENABLED:true" \
-                --var "OIDC_DISCOVERY_URL:$OIDC_DISCOVERY_URL" \
-                --var "OIDC_CLIENT_ID:$OIDC_CLIENT_ID" \
-                --var "OIDC_REDIRECT_URI:$OIDC_REDIRECT_URI" \
-                --var "OAUTH_FRONTEND_REDIRECT_URIS:$OAUTH_FRONTEND_REDIRECT_URIS"
+              if [ "$OAUTH_PROVIDER_TYPE" = 'oidc' ]; then
+                pnpm --filter @industrial/oauth exec -- npx wrangler deploy \
+                  --secrets-file "$RUNNER_TEMP/oauth-secrets.json" \
+                  --var "OAUTH_ENABLED:true" \
+                  --var "OAUTH_PROVIDER_TYPE:oidc" \
+                  --var "OIDC_DISCOVERY_URL:$OIDC_DISCOVERY_URL" \
+                  --var "OIDC_CLIENT_ID:$OIDC_CLIENT_ID" \
+                  --var "OAUTH_REDIRECT_URI:$OAUTH_REDIRECT_URI" \
+                  --var "OAUTH_FRONTEND_REDIRECT_URIS:$OAUTH_FRONTEND_REDIRECT_URIS"
+              else
+                pnpm --filter @industrial/oauth exec -- npx wrangler deploy \
+                  --secrets-file "$RUNNER_TEMP/oauth-secrets.json" \
+                  --var "OAUTH_ENABLED:true" \
+                  --var "OAUTH_PROVIDER_TYPE:orangeauth" \
+                  --var "ORANGEAUTH_BASE_URL:$ORANGEAUTH_BASE_URL" \
+                  --var "ORANGEAUTH_CLIENT_ID:$ORANGEAUTH_CLIENT_ID" \
+                  --var "ORANGEAUTH_SCOPE:$ORANGEAUTH_SCOPE" \
+                  --var "OAUTH_REDIRECT_URI:$OAUTH_REDIRECT_URI" \
+                  --var "OAUTH_FRONTEND_REDIRECT_URIS:$OAUTH_FRONTEND_REDIRECT_URIS"
+              fi
             else
               pnpm --filter @industrial/oauth exec -- npx wrangler deploy \
                 --secrets-file "$RUNNER_TEMP/oauth-secrets.json" \

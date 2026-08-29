@@ -4,12 +4,14 @@ import type {
   OAuthLoginTransaction,
   OAuthMapping,
 } from "./model";
+import type { LoginProviderType } from "./provider";
 
 interface LoginTransactionRow {
   state_hash: string;
   state_value: string;
   code_verifier: string;
-  nonce: string;
+  provider_type: LoginProviderType;
+  provider_context: string;
   frontend_redirect_uri: string;
   oauth_channel: string;
   expires_at: string;
@@ -18,7 +20,7 @@ interface LoginTransactionRow {
 }
 
 interface MappingRow {
-  issuer: string;
+  provider_key: string;
   subject: string;
   account_id: string;
   created_at: string;
@@ -39,7 +41,7 @@ export interface OAuthRepository {
     stateHash: string,
     consumedAt: string,
   ): Promise<OAuthLoginTransaction | null>;
-  findMapping(issuer: string, subject: string): Promise<OAuthMapping | null>;
+  findMapping(providerKey: string, subject: string): Promise<OAuthMapping | null>;
   createMappingIfAbsent(mapping: OAuthMapping): Promise<OAuthMapping>;
   createCallbackCode(code: OAuthCallbackCode): Promise<void>;
   consumeCallbackCode(
@@ -54,7 +56,8 @@ function toLoginTransaction(row: LoginTransactionRow): OAuthLoginTransaction {
     stateHash: row.state_hash,
     stateValue: row.state_value,
     codeVerifier: row.code_verifier,
-    nonce: row.nonce,
+    providerType: row.provider_type,
+    providerContext: row.provider_context,
     frontendRedirectUri: row.frontend_redirect_uri,
     oauthChannel: row.oauth_channel,
     expiresAt: row.expires_at,
@@ -65,7 +68,7 @@ function toLoginTransaction(row: LoginTransactionRow): OAuthLoginTransaction {
 
 function toMapping(row: MappingRow): OAuthMapping {
   return {
-    issuer: row.issuer,
+    providerKey: row.provider_key,
     subject: row.subject,
     accountId: row.account_id,
     createdAt: row.created_at,
@@ -77,14 +80,15 @@ export function createOAuthRepository(db: D1Database): OAuthRepository {
     async createLoginTransaction(transaction) {
       await db.prepare(
         `INSERT INTO oauth_login_transactions(
-           state_hash, state_value, code_verifier, nonce, frontend_redirect_uri,
-           oauth_channel, expires_at, consumed_at, created_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)`,
+           state_hash, state_value, code_verifier, provider_type, provider_context,
+           frontend_redirect_uri, oauth_channel, expires_at, consumed_at, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)`,
       ).bind(
         transaction.stateHash,
         transaction.stateValue,
         transaction.codeVerifier,
-        transaction.nonce,
+        transaction.providerType,
+        transaction.providerContext,
         transaction.frontendRedirectUri,
         transaction.oauthChannel,
         transaction.expiresAt,
@@ -98,37 +102,37 @@ export function createOAuthRepository(db: D1Database): OAuthRepository {
         `UPDATE oauth_login_transactions
          SET consumed_at=?2
          WHERE state_hash=?1 AND consumed_at IS NULL AND expires_at>?2
-         RETURNING state_hash, state_value, code_verifier, nonce,
+         RETURNING state_hash, state_value, code_verifier, provider_type, provider_context,
                    frontend_redirect_uri, oauth_channel, expires_at,
                    consumed_at, created_at`,
       ).bind(stateHash, consumedAt).first<LoginTransactionRow>();
       return row ? toLoginTransaction(row) : null;
     },
 
-    async findMapping(issuer, subject) {
+    async findMapping(providerKey, subject) {
       const row = await db.prepare(
-        `SELECT issuer, subject, account_id, created_at
-         FROM oauth_mappings WHERE issuer=?1 AND subject=?2`,
-      ).bind(issuer, subject).first<MappingRow>();
+        `SELECT provider_key, subject, account_id, created_at
+         FROM oauth_mappings WHERE provider_key=?1 AND subject=?2`,
+      ).bind(providerKey, subject).first<MappingRow>();
       return row ? toMapping(row) : null;
     },
 
     async createMappingIfAbsent(mapping) {
       await db.prepare(
-        `INSERT OR IGNORE INTO oauth_mappings(issuer, subject, account_id, created_at)
+        `INSERT OR IGNORE INTO oauth_mappings(provider_key, subject, account_id, created_at)
          VALUES (?1, ?2, ?3, ?4)`,
       ).bind(
-        mapping.issuer,
+        mapping.providerKey,
         mapping.subject,
         mapping.accountId,
         mapping.createdAt,
       ).run();
 
       const row = await db.prepare(
-        `SELECT issuer, subject, account_id, created_at
-         FROM oauth_mappings WHERE issuer=?1 AND subject=?2`,
-      ).bind(mapping.issuer, mapping.subject).first<MappingRow>();
-      if (!row) throw new Error("OIDC identity mapping write did not persist");
+        `SELECT provider_key, subject, account_id, created_at
+         FROM oauth_mappings WHERE provider_key=?1 AND subject=?2`,
+      ).bind(mapping.providerKey, mapping.subject).first<MappingRow>();
+      if (!row) throw new Error("登录身份映射写入后不存在");
       return toMapping(row);
     },
 
